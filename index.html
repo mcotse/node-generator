@@ -1021,7 +1021,9 @@
       constructor(scene) {
         this.scene = scene;
         this.mesh = null;
+        this.meshes = [];
         this.nodeIds = [];
+        this.meshNodeIds = [];
         this.dummy = new THREE.Object3D();
         this.geometries = {
           sphere: new THREE.SphereGeometry(1, 16, 12),
@@ -1054,21 +1056,11 @@
       update(graph, params) {
         this.dispose();
 
-        const { shape, size, color, opacity, emissive, emissiveIntensity, colorByDepth, leafColor } = params;
-        const geo = this.geometries[shape] || this.geometries.sphere;
-        const mat = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(color),
-          transparent: opacity < 1,
-          opacity,
-          emissive: new THREE.Color(emissive),
-          emissiveIntensity,
-        });
+        const { shape, size, color, opacity, emissive, emissiveIntensity, colorByDepth, leafColor,
+                shapeByType, rootShape, branchShape, leafShape } = params;
 
         const count = graph.nodes.size;
         if (count === 0) return;
-
-        this.mesh = new THREE.InstancedMesh(geo, mat, count);
-        this.nodeIds = [];
 
         const baseColor = new THREE.Color(color);
         const tipColor = new THREE.Color(leafColor || color);
@@ -1077,47 +1069,126 @@
           maxDepth = Math.max(maxDepth, node.metadata.depth || 0);
         }
 
-        let i = 0;
-        for (const [id, node] of graph.nodes) {
+        const makeMaterial = () => new THREE.MeshStandardMaterial({
+          color: new THREE.Color(color),
+          transparent: opacity < 1,
+          opacity,
+          emissive: new THREE.Color(emissive),
+          emissiveIntensity,
+        });
+
+        const setInstance = (mesh, instanceIdx, node, id) => {
           this.dummy.position.copy(node.position);
           const depthRatio = maxDepth > 0 ? (node.metadata.depth || 0) / maxDepth : 0;
           const scale = node.metadata.type === 'leaf' ? 0.5 : 1 - depthRatio * 0.4;
           this.dummy.scale.setScalar(size * Math.max(0.2, scale));
           this.dummy.updateMatrix();
-          this.mesh.setMatrixAt(i, this.dummy.matrix);
+          mesh.setMatrixAt(instanceIdx, this.dummy.matrix);
 
           if (colorByDepth && maxDepth > 0) {
             const c = baseColor.clone().lerp(tipColor, depthRatio);
-            this.mesh.setColorAt(i, c);
+            mesh.setColorAt(instanceIdx, c);
           } else {
-            this.mesh.setColorAt(i, baseColor);
+            mesh.setColorAt(instanceIdx, baseColor);
+          }
+        };
+
+        if (!shapeByType) {
+          // Single-mesh mode
+          const geo = this.geometries[shape] || this.geometries.sphere;
+          const mat = makeMaterial();
+          const mesh = new THREE.InstancedMesh(geo, mat, count);
+          const ids = [];
+
+          let i = 0;
+          for (const [id, node] of graph.nodes) {
+            setInstance(mesh, i, node, id);
+            ids.push(id);
+            i++;
           }
 
-          this.nodeIds.push(id);
-          i++;
+          mesh.instanceMatrix.needsUpdate = true;
+          if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+          this.scene.add(mesh);
+
+          this.mesh = mesh;
+          this.meshes = [mesh];
+          this.meshNodeIds = [ids];
+          this.nodeIds = ids;
+        } else {
+          // Multi-mesh mode: group nodes by type → shape
+          const typeShapeMap = { root: rootShape, branch: branchShape, leaf: leafShape };
+          // Group nodes by their resolved shape
+          const shapeGroups = new Map(); // shape -> [{id, node}]
+          for (const [id, node] of graph.nodes) {
+            const nodeType = node.metadata.type || 'branch';
+            const shapeName = typeShapeMap[nodeType] || shape;
+            if (!shapeGroups.has(shapeName)) shapeGroups.set(shapeName, []);
+            shapeGroups.get(shapeName).push({ id, node });
+          }
+
+          this.meshes = [];
+          this.meshNodeIds = [];
+          this.nodeIds = [];
+          this.mesh = null;
+
+          for (const [shapeName, nodes] of shapeGroups) {
+            const geo = this.geometries[shapeName] || this.geometries.sphere;
+            const mat = makeMaterial();
+            const mesh = new THREE.InstancedMesh(geo, mat, nodes.length);
+            const ids = [];
+
+            for (let i = 0; i < nodes.length; i++) {
+              const { id, node } = nodes[i];
+              setInstance(mesh, i, node, id);
+              ids.push(id);
+            }
+
+            mesh.instanceMatrix.needsUpdate = true;
+            if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+            this.scene.add(mesh);
+
+            this.meshes.push(mesh);
+            this.meshNodeIds.push(ids);
+            this.nodeIds.push(...ids);
+          }
+
+          // Set this.mesh to first mesh for minimal backward compat
+          if (this.meshes.length > 0) this.mesh = this.meshes[0];
         }
 
-        this.mesh.instanceMatrix.needsUpdate = true;
-        if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
-        this.scene.add(this.mesh);
+        // Store for future use by tick() (Task 4)
+        this._lastGraph = graph;
+        this._maxDepth = maxDepth;
       }
 
-      getNodeIdAtIndex(index) {
-        return this.nodeIds[index];
+      getNodeIdAtIndex(meshIndex, instanceId) {
+        // Support both old single-arg and new two-arg calling conventions
+        if (instanceId === undefined) {
+          // Legacy single-arg: meshIndex is actually the flat instanceId
+          return this.nodeIds[meshIndex];
+        }
+        return this.meshNodeIds[meshIndex]?.[instanceId];
       }
 
       getIndexForNodeId(id) {
         return this.nodeIds.indexOf(id);
       }
 
+      getMeshIndex(mesh) {
+        return this.meshes.indexOf(mesh);
+      }
+
       dispose() {
-        if (this.mesh) {
-          this.scene.remove(this.mesh);
-          this.mesh.material.dispose();
-          this.mesh.dispose(); // Free instanceMatrix/instanceColor GPU buffers
-          this.mesh = null;
-          this.nodeIds = [];
+        for (const mesh of this.meshes) {
+          this.scene.remove(mesh);
+          mesh.material.dispose();
+          mesh.dispose();
         }
+        this.mesh = null;
+        this.meshes = [];
+        this.nodeIds = [];
+        this.meshNodeIds = [];
       }
     }
 
@@ -1249,19 +1320,32 @@
         window.addEventListener('click', e => this.onClick(e));
       }
 
+      _findHitNode() {
+        const meshes = this.app.nodeRenderer.meshes;
+        let closestHit = null, hitMesh = null;
+        for (const mesh of meshes) {
+          const hits = this.raycaster.intersectObject(mesh);
+          if (hits.length > 0 && (!closestHit || hits[0].distance < closestHit.distance)) {
+            closestHit = hits[0];
+            hitMesh = mesh;
+          }
+        }
+        if (!closestHit || !hitMesh) return null;
+        const meshIdx = this.app.nodeRenderer.getMeshIndex(hitMesh);
+        const nodeId = this.app.nodeRenderer.getNodeIdAtIndex(meshIdx, closestHit.instanceId);
+        return { nodeId, hit: closestHit };
+      }
+
       onMouseMove(e) {
         this.mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
         this.mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
 
         this.raycaster.setFromCamera(this.mouse, this.app.camera);
-        const mesh = this.app.nodeRenderer.mesh;
-        if (!mesh) { this.tooltip.style.display = 'none'; return; }
+        if (this.app.nodeRenderer.meshes.length === 0) { this.tooltip.style.display = 'none'; return; }
 
-        const hits = this.raycaster.intersectObject(mesh);
-        if (hits.length > 0) {
-          const idx = hits[0].instanceId;
-          const nodeId = this.app.nodeRenderer.getNodeIdAtIndex(idx);
-          const node = this.app.graph.getNode(nodeId);
+        const result = this._findHitNode();
+        if (result) {
+          const node = this.app.graph.getNode(result.nodeId);
           if (node) {
             this.tooltip.style.display = 'block';
             this.tooltip.style.left = Math.min(e.clientX + 15, window.innerWidth - 300) + 'px';
@@ -1283,14 +1367,11 @@
         if (e.target.closest('.lil-gui')) return;
 
         this.raycaster.setFromCamera(this.mouse, this.app.camera);
-        const mesh = this.app.nodeRenderer.mesh;
-        if (!mesh) return;
+        if (this.app.nodeRenderer.meshes.length === 0) return;
 
-        const hits = this.raycaster.intersectObject(mesh);
-        if (hits.length > 0) {
-          const idx = hits[0].instanceId;
-          const nodeId = this.app.nodeRenderer.getNodeIdAtIndex(idx);
-          this.highlightNode(nodeId);
+        const result = this._findHitNode();
+        if (result) {
+          this.highlightNode(result.nodeId);
         } else {
           this.clearHighlight();
         }
@@ -1299,22 +1380,20 @@
       highlightNode(nodeId) {
         this.clearHighlight();
         this.highlightedNodeId = nodeId;
-        const mesh = this.app.nodeRenderer.mesh;
-        if (!mesh || !mesh.instanceColor) return;
-
         const neighborIds = this.app.graph.getNeighborIds(nodeId);
         const highlightMain = new THREE.Color(0xff3300);
         const highlightNeighbor = new THREE.Color(0xff6600);
 
-        for (let i = 0; i < this.app.nodeRenderer.nodeIds.length; i++) {
-          const nid = this.app.nodeRenderer.nodeIds[i];
-          if (nid === nodeId) {
-            mesh.setColorAt(i, highlightMain);
-          } else if (neighborIds.has(nid)) {
-            mesh.setColorAt(i, highlightNeighbor);
+        for (let m = 0; m < this.app.nodeRenderer.meshes.length; m++) {
+          const mesh = this.app.nodeRenderer.meshes[m];
+          const ids = this.app.nodeRenderer.meshNodeIds[m];
+          if (!mesh.instanceColor) continue;
+          for (let i = 0; i < ids.length; i++) {
+            if (ids[i] === nodeId) mesh.setColorAt(i, highlightMain);
+            else if (neighborIds.has(ids[i])) mesh.setColorAt(i, highlightNeighbor);
           }
+          mesh.instanceColor.needsUpdate = true;
         }
-        mesh.instanceColor.needsUpdate = true;
 
         // Highlight connected edges
         const edgeIndices = this.app.graph.getConnectedEdgeIndices(nodeId);
@@ -1398,6 +1477,18 @@
           'dodecahedron', 'cone', 'cylinder', 'torus', 'torusknot',
           'capsule', 'diamond'
         ]).name('Shape').onChange(() => this.app.updateVisuals());
+
+        const shapeList = ['sphere', 'cube', 'octahedron', 'tetrahedron', 'icosahedron',
+          'dodecahedron', 'cone', 'cylinder', 'torus', 'torusknot', 'capsule', 'diamond'];
+        f.add(this.app.nodeParams, 'shapeByType')
+          .name('Shape by Type').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'rootShape', shapeList)
+          .name('Root Shape').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'branchShape', shapeList)
+          .name('Branch Shape').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'leafShape', shapeList)
+          .name('Leaf Shape').onChange(() => this.app.updateVisuals());
+
         f.add(this.app.nodeParams, 'size', 0.02, 0.5)
           .name('Size').onChange(() => this.app.updateVisuals());
         f.addColor(this.app.nodeParams, 'color')
@@ -1489,6 +1580,10 @@
           emissiveIntensity: 0.0,
           colorByDepth: true,
           leafColor: '#88aacc',
+          shapeByType: false,
+          rootShape: 'icosahedron',
+          branchShape: 'sphere',
+          leafShape: 'diamond',
         };
 
         this.edgeParams = {
