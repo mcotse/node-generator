@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Node Pathway Visualizer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; }
+    canvas { display: block; }
+    #tooltip {
+      position: absolute; background: rgba(255,255,255,0.95); border: 1px solid #ddd;
+      border-radius: 6px; padding: 8px 12px; font-size: 13px; pointer-events: none;
+      display: none; max-width: 280px; box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+      line-height: 1.5; z-index: 100;
+    }
+    #tooltip .key { color: #888; font-size: 12px; }
+    #tooltip .val { color: #333; font-weight: 500; }
+    #info {
+      position: absolute; bottom: 12px; left: 12px; color: #aaa; font-size: 12px;
+      pointer-events: none; user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="tooltip"></div>
+  <div id="info">Scroll to zoom · Drag to orbit · Right-drag to pan</div>
+  <input type="file" id="fileInput" accept=".json" style="display:none">
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20.0/dist/lil-gui.esm.min.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+    import GUI from 'lil-gui';
+
+    // ─── Graph Data Model ───────────────────────────────────────────────
+
+    class Graph {
+      constructor() {
+        this.nodes = new Map();
+        this.edges = [];
+      }
+
+      addNode(id, position, metadata = {}) {
+        this.nodes.set(id, { id, position: position.clone(), metadata });
+        return this;
+      }
+
+      addEdge(sourceId, targetId, metadata = {}) {
+        this.edges.push({ source: sourceId, target: targetId, metadata });
+        return this;
+      }
+
+      clear() {
+        this.nodes.clear();
+        this.edges.length = 0;
+      }
+
+      getNode(id) {
+        return this.nodes.get(id);
+      }
+
+      getNeighborIds(id) {
+        const neighbors = new Set();
+        for (const e of this.edges) {
+          if (e.source === id) neighbors.add(e.target);
+          if (e.target === id) neighbors.add(e.source);
+        }
+        return neighbors;
+      }
+
+      getConnectedEdgeIndices(id) {
+        const indices = [];
+        for (let i = 0; i < this.edges.length; i++) {
+          if (this.edges[i].source === id || this.edges[i].target === id) indices.push(i);
+        }
+        return indices;
+      }
+
+      toJSON() {
+        return {
+          nodes: Array.from(this.nodes.values()).map(n => ({
+            id: n.id,
+            position: [n.position.x, n.position.y, n.position.z],
+            metadata: n.metadata,
+          })),
+          edges: this.edges.map(e => ({
+            source: e.source, target: e.target, metadata: e.metadata,
+          })),
+        };
+      }
+
+      static fromJSON(json) {
+        const g = new Graph();
+        for (const n of json.nodes) {
+          g.addNode(n.id, new THREE.Vector3(...n.position), n.metadata || {});
+        }
+        for (const e of json.edges) {
+          g.addEdge(e.source, e.target, e.metadata || {});
+        }
+        return g;
+      }
+    }
+
+    // ─── Recursive Subdivision Generator ────────────────────────────────
+
+    class RecursiveGenerator {
+      generate(params) {
+        const { depth, branchAngle, lengthRatio, childrenCount, jitter, trunkLength } = params;
+        const graph = new Graph();
+        let nextId = 0;
+
+        const rootId = nextId++;
+        graph.addNode(rootId, new THREE.Vector3(0, 0, 0), { depth: 0, type: 'root' });
+
+        this._branch(graph, rootId, new THREE.Vector3(0, 1, 0), trunkLength, 0, depth,
+          branchAngle, lengthRatio, childrenCount, jitter, () => nextId++);
+
+        return graph;
+      }
+
+      _branch(graph, parentId, direction, length, currentDepth, maxDepth,
+              angle, ratio, children, jitter, nextId) {
+        if (currentDepth >= maxDepth) return;
+
+        const parentPos = graph.getNode(parentId).position;
+        const endPos = parentPos.clone().add(direction.clone().multiplyScalar(length));
+        const nodeId = nextId();
+        const isLeaf = currentDepth + 1 === maxDepth;
+        graph.addNode(nodeId, endPos, { depth: currentDepth + 1, type: isLeaf ? 'leaf' : 'branch' });
+        graph.addEdge(parentId, nodeId);
+
+        const up = direction.clone().normalize();
+        const perp = new THREE.Vector3(1, 0, 0);
+        if (Math.abs(up.dot(perp)) > 0.9) perp.set(0, 0, 1);
+        const side = new THREE.Vector3().crossVectors(up, perp).normalize();
+        const forward = new THREE.Vector3().crossVectors(side, up).normalize();
+
+        for (let i = 0; i < children; i++) {
+          const phi = (i / children) * Math.PI * 2 + (Math.random() - 0.5) * jitter;
+          const theta = angle * (Math.PI / 180) + (Math.random() - 0.5) * jitter * 0.3;
+          const newDir = new THREE.Vector3()
+            .addScaledVector(up, Math.cos(theta))
+            .addScaledVector(side, Math.sin(theta) * Math.cos(phi))
+            .addScaledVector(forward, Math.sin(theta) * Math.sin(phi))
+            .normalize();
+
+          this._branch(graph, nodeId, newDir, length * ratio, currentDepth + 1, maxDepth,
+            angle, ratio, children, jitter, nextId);
+        }
+      }
+    }
+
+    // ─── L-System Generator ─────────────────────────────────────────────
+
+    class LSystemGenerator {
+      generate(params) {
+        const { depth, branchAngle, lengthRatio, jitter, trunkLength } = params;
+        const axiom = 'F';
+        const rules = { 'F': 'F[&+F]F[-\\F][^/F]' };
+
+        let current = axiom;
+        const iterations = Math.min(depth, 7);
+        for (let i = 0; i < iterations; i++) {
+          let next = '';
+          for (const ch of current) next += rules[ch] || ch;
+          current = next;
+        }
+
+        const graph = new Graph();
+        let nodeId = 0;
+        const stack = [];
+        let pos = new THREE.Vector3(0, 0, 0);
+        let dir = new THREE.Vector3(0, 1, 0);
+        let right = new THREE.Vector3(1, 0, 0);
+        let fwd = new THREE.Vector3(0, 0, 1);
+        let len = trunkLength;
+        let parentId = nodeId;
+        graph.addNode(nodeId++, pos.clone(), { depth: 0, type: 'root' });
+
+        const rad = branchAngle * Math.PI / 180;
+
+        for (const ch of current) {
+          const j = (Math.random() - 0.5) * jitter * 0.5;
+          switch (ch) {
+            case 'F': {
+              const newPos = pos.clone().add(dir.clone().multiplyScalar(len));
+              const nid = nodeId++;
+              graph.addNode(nid, newPos, { depth: stack.length, type: 'branch' });
+              graph.addEdge(parentId, nid);
+              pos = newPos;
+              parentId = nid;
+              break;
+            }
+            case '+': this._rotate(dir, fwd, rad + j); this._rotate(right, fwd, rad + j); break;
+            case '-': this._rotate(dir, fwd, -rad - j); this._rotate(right, fwd, -rad - j); break;
+            case '&': this._rotate(dir, right, rad + j); this._rotate(fwd, right, rad + j); break;
+            case '^': this._rotate(dir, right, -rad - j); this._rotate(fwd, right, -rad - j); break;
+            case '\\': this._rotate(right, dir, rad + j); this._rotate(fwd, dir, rad + j); break;
+            case '/': this._rotate(right, dir, -rad - j); this._rotate(fwd, dir, -rad - j); break;
+            case '[':
+              stack.push({ pos: pos.clone(), dir: dir.clone(), right: right.clone(), fwd: fwd.clone(), len, parentId });
+              len *= lengthRatio;
+              break;
+            case ']': {
+              const s = stack.pop();
+              if (s) { pos = s.pos; dir = s.dir; right = s.right; fwd = s.fwd; len = s.len; parentId = s.parentId; }
+              break;
+            }
+          }
+        }
+
+        this._markLeaves(graph);
+        return graph;
+      }
+
+      _rotate(v, axis, angle) {
+        v.applyAxisAngle(axis.clone().normalize(), angle);
+      }
+
+      _markLeaves(graph) {
+        const hasChildren = new Set();
+        for (const e of graph.edges) hasChildren.add(e.source);
+        for (const [id, node] of graph.nodes) {
+          if (!hasChildren.has(id) && node.metadata.type !== 'root') {
+            node.metadata.type = 'leaf';
+          }
+        }
+      }
+    }
+
+    // ─── Space Colonization Generator ───────────────────────────────────
+
+    class SpaceColonizationGenerator {
+      generate(params) {
+        const { depth, jitter, trunkLength } = params;
+        const graph = new Graph();
+        let nodeId = 0;
+
+        const crownCenter = new THREE.Vector3(0, trunkLength + 3, 0);
+        const crownRadius = trunkLength * 0.8;
+        const attractorCount = Math.min(depth * 50, 500);
+        const attractors = [];
+
+        for (let i = 0; i < attractorCount; i++) {
+          const u = Math.random(), v = Math.random();
+          const theta = 2 * Math.PI * u;
+          const phi = Math.acos(2 * v - 1);
+          const r = crownRadius * Math.cbrt(Math.random());
+          attractors.push(new THREE.Vector3(
+            r * Math.sin(phi) * Math.cos(theta),
+            r * Math.sin(phi) * Math.sin(theta),
+            r * Math.cos(phi)
+          ).add(crownCenter));
+        }
+
+        const trunkSteps = 5;
+        for (let i = 0; i <= trunkSteps; i++) {
+          const pos = new THREE.Vector3(0, (i / trunkSteps) * trunkLength, 0);
+          const nid = nodeId++;
+          graph.addNode(nid, pos, { depth: 0, type: i === 0 ? 'root' : 'branch' });
+          if (i > 0) graph.addEdge(nid - 1, nid);
+        }
+
+        const influenceRadius = crownRadius * 0.6;
+        const killRadius = crownRadius * 0.08;
+        const segmentLength = trunkLength * 0.12;
+        const maxIter = Math.min(depth * 15, 150);
+
+        for (let iter = 0; iter < maxIter && attractors.length > 0; iter++) {
+          const influence = new Map();
+
+          for (let ai = attractors.length - 1; ai >= 0; ai--) {
+            const attr = attractors[ai];
+            let closestId = null, closestDist = Infinity;
+            for (const [nid, node] of graph.nodes) {
+              const d = node.position.distanceTo(attr);
+              if (d < closestDist) { closestDist = d; closestId = nid; }
+            }
+            if (closestDist < killRadius) { attractors.splice(ai, 1); continue; }
+            if (closestDist < influenceRadius) {
+              if (!influence.has(closestId)) influence.set(closestId, []);
+              influence.get(closestId).push(attr.clone().sub(graph.getNode(closestId).position).normalize());
+            }
+          }
+
+          if (influence.size === 0) break;
+
+          for (const [nid, dirs] of influence) {
+            const avg = new THREE.Vector3();
+            for (const d of dirs) avg.add(d);
+            avg.normalize();
+            avg.x += (Math.random() - 0.5) * jitter * 0.3;
+            avg.y += (Math.random() - 0.5) * jitter * 0.3;
+            avg.z += (Math.random() - 0.5) * jitter * 0.3;
+            avg.normalize();
+
+            const parentPos = graph.getNode(nid).position;
+            const newPos = parentPos.clone().add(avg.multiplyScalar(segmentLength));
+            const newId = nodeId++;
+            const parentDepth = graph.getNode(nid).metadata.depth || 0;
+            graph.addNode(newId, newPos, { depth: parentDepth + 1, type: 'branch' });
+            graph.addEdge(nid, newId);
+          }
+        }
+
+        const hasChildren = new Set();
+        for (const e of graph.edges) hasChildren.add(e.source);
+        for (const [id, node] of graph.nodes) {
+          if (!hasChildren.has(id) && node.metadata.type !== 'root') node.metadata.type = 'leaf';
+        }
+
+        return graph;
+      }
+    }
+
+    // ─── Spatial Index (3D Grid) ──────────────────────────────────────
+    class SpatialIndex {
+      constructor(cellSize = 1.0) {
+        this.cellSize = cellSize;
+        this.cells = new Map();
+      }
+
+      _key(x, y, z) {
+        const cx = Math.floor(x / this.cellSize);
+        const cy = Math.floor(y / this.cellSize);
+        const cz = Math.floor(z / this.cellSize);
+        return `${cx},${cy},${cz}`;
+      }
+
+      insert(position, id) {
+        const key = this._key(position.x, position.y, position.z);
+        if (!this.cells.has(key)) this.cells.set(key, []);
+        this.cells.get(key).push({ position, id });
+      }
+
+      query(position, radius) {
+        const results = [];
+        const r = Math.ceil(radius / this.cellSize);
+        const cx = Math.floor(position.x / this.cellSize);
+        const cy = Math.floor(position.y / this.cellSize);
+        const cz = Math.floor(position.z / this.cellSize);
+
+        for (let dx = -r; dx <= r; dx++) {
+          for (let dy = -r; dy <= r; dy++) {
+            for (let dz = -r; dz <= r; dz++) {
+              const key = `${cx + dx},${cy + dy},${cz + dz}`;
+              const cell = this.cells.get(key);
+              if (!cell) continue;
+              for (const entry of cell) {
+                const dist = position.distanceTo(entry.position);
+                if (dist < radius) {
+                  results.push({ id: entry.id, position: entry.position, distance: dist });
+                }
+              }
+            }
+          }
+        }
+        return results;
+      }
+
+      clear() {
+        this.cells.clear();
+      }
+    }
+
+    // ─── Flow Field Generator ─────────────────────────────────────────
+
+    class FlowFieldGenerator {
+      generate(params) {
+        const { depth, jitter, trunkLength, branchAngle } = params;
+        const graph = new Graph();
+        let nodeId = 0;
+
+        const particleCount = Math.min(depth * 8, 60);
+        const stepsPerParticle = Math.min(depth * 12, 80);
+        const stepSize = trunkLength * 0.15;
+        const noiseScale = 0.12 + (1 - jitter) * 0.08;
+        const angleBase = branchAngle * Math.PI / 180;
+
+        // Simple 3D noise using layered sine waves (no dependency needed)
+        const noise3 = (x, y, z) => {
+          return (
+            Math.sin(x * 1.7 + y * 2.3 + z * 0.9) * 0.5 +
+            Math.sin(x * 0.8 - y * 1.4 + z * 2.1) * 0.3 +
+            Math.sin(x * 2.5 + y * 0.6 - z * 1.8) * 0.2
+          );
+        };
+
+        const flowDir = (pos) => {
+          const s = noiseScale;
+          const dx = noise3(pos.x * s + 3.1, pos.y * s + 7.2, pos.z * s + 1.4);
+          const dy = noise3(pos.x * s + 5.9, pos.y * s + 0.3, pos.z * s + 8.7);
+          const dz = noise3(pos.x * s + 9.6, pos.y * s + 4.8, pos.z * s + 2.5);
+          return new THREE.Vector3(dx, Math.abs(dy) * 0.5 + 0.5, dz).normalize();
+        };
+
+        // Spawn particles on a disk at the base
+        const spawnRadius = trunkLength * 0.4;
+        for (let p = 0; p < particleCount; p++) {
+          const angle = (p / particleCount) * Math.PI * 2;
+          const r = spawnRadius * Math.sqrt((p + 1) / particleCount);
+          let pos = new THREE.Vector3(
+            Math.cos(angle) * r,
+            0,
+            Math.sin(angle) * r
+          );
+
+          const startId = nodeId;
+          const rootNid = nodeId++;
+          graph.addNode(rootNid, pos.clone(), { depth: 0, type: 'root' });
+
+          let prevId = rootNid;
+          for (let s = 0; s < stepsPerParticle; s++) {
+            const dir = flowDir(pos);
+            // Add curvature variation
+            dir.x += (Math.random() - 0.5) * jitter * 0.4;
+            dir.z += (Math.random() - 0.5) * jitter * 0.4;
+            dir.normalize();
+
+            pos = pos.clone().add(dir.multiplyScalar(stepSize));
+            const nid = nodeId++;
+            const isLast = s === stepsPerParticle - 1;
+            graph.addNode(nid, pos.clone(), {
+              depth: s + 1,
+              type: isLast ? 'leaf' : 'branch',
+            });
+            graph.addEdge(prevId, nid);
+            prevId = nid;
+          }
+        }
+
+        // Connect nearby particles at branch points for field convergence
+        const allNodes = Array.from(graph.nodes.values());
+        const connectThreshold = stepSize * 2.5;
+        for (let i = 0; i < allNodes.length; i++) {
+          const a = allNodes[i];
+          if (a.metadata.depth > 0 && a.metadata.depth % Math.max(3, Math.floor(stepsPerParticle / 4)) === 0) {
+            for (let j = i + 1; j < allNodes.length; j++) {
+              const b = allNodes[j];
+              if (Math.abs(a.metadata.depth - b.metadata.depth) <= 1 &&
+                  a.position.distanceTo(b.position) < connectThreshold) {
+                graph.addEdge(a.id, b.id);
+                break;
+              }
+            }
+          }
+        }
+
+        return graph;
+      }
+    }
+
+    // ─── Particle System Generator ────────────────────────────────────
+
+    class ParticleSystemGenerator {
+      generate(params) {
+        const { depth, jitter, trunkLength, childrenCount } = params;
+        const graph = new Graph();
+        let nodeId = 0;
+
+        const count = Math.min(depth * 15, 120);
+        const simSteps = Math.min(depth * 10, 80);
+        const bounds = trunkLength * 2;
+
+        // Initialize particles with random positions in a sphere
+        const particles = [];
+        for (let i = 0; i < count; i++) {
+          const theta = Math.random() * Math.PI * 2;
+          const phi = Math.acos(2 * Math.random() - 1);
+          const r = bounds * 0.5 * Math.cbrt(Math.random());
+          particles.push({
+            pos: new THREE.Vector3(
+              r * Math.sin(phi) * Math.cos(theta),
+              r * Math.sin(phi) * Math.sin(theta) + trunkLength,
+              r * Math.cos(phi)
+            ),
+            vel: new THREE.Vector3(
+              (Math.random() - 0.5) * 0.1,
+              (Math.random() - 0.5) * 0.1,
+              (Math.random() - 0.5) * 0.1
+            ),
+            trail: [],
+          });
+        }
+
+        // Flocking-style simulation
+        const separationDist = trunkLength * 0.2;
+        const cohesionDist = trunkLength * 0.8;
+        const maxSpeed = trunkLength * 0.08;
+
+        for (let step = 0; step < simSteps; step++) {
+          for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            const sep = new THREE.Vector3();
+            const coh = new THREE.Vector3();
+            const ali = new THREE.Vector3();
+            let sepCount = 0, cohCount = 0;
+
+            for (let j = 0; j < particles.length; j++) {
+              if (i === j) continue;
+              const dist = p.pos.distanceTo(particles[j].pos);
+
+              // Separation
+              if (dist < separationDist && dist > 0.001) {
+                const diff = p.pos.clone().sub(particles[j].pos).normalize().divideScalar(dist);
+                sep.add(diff);
+                sepCount++;
+              }
+              // Cohesion + alignment
+              if (dist < cohesionDist) {
+                coh.add(particles[j].pos);
+                ali.add(particles[j].vel);
+                cohCount++;
+              }
+            }
+
+            if (sepCount > 0) sep.divideScalar(sepCount);
+            if (cohCount > 0) {
+              coh.divideScalar(cohCount).sub(p.pos).multiplyScalar(0.01);
+              ali.divideScalar(cohCount).multiplyScalar(0.05);
+            }
+
+            // Attraction toward center
+            const toCenter = new THREE.Vector3(0, trunkLength, 0).sub(p.pos).multiplyScalar(0.002);
+
+            p.vel.add(sep.multiplyScalar(0.5 + jitter));
+            p.vel.add(coh);
+            p.vel.add(ali);
+            p.vel.add(toCenter);
+
+            // Random perturbation
+            p.vel.x += (Math.random() - 0.5) * jitter * 0.05;
+            p.vel.y += (Math.random() - 0.5) * jitter * 0.05;
+            p.vel.z += (Math.random() - 0.5) * jitter * 0.05;
+
+            // Clamp speed
+            if (p.vel.length() > maxSpeed) p.vel.normalize().multiplyScalar(maxSpeed);
+
+            p.pos.add(p.vel);
+            p.trail.push(p.pos.clone());
+          }
+        }
+
+        // Build graph from trails (sample every few steps to keep node count manageable)
+        const sampleRate = Math.max(1, Math.floor(simSteps / Math.min(depth * 3, 20)));
+        for (const p of particles) {
+          let prevId = null;
+          for (let s = 0; s < p.trail.length; s += sampleRate) {
+            const nid = nodeId++;
+            const d = Math.floor(s / sampleRate);
+            const isFirst = prevId === null;
+            const isLast = s + sampleRate >= p.trail.length;
+            graph.addNode(nid, p.trail[s], {
+              depth: d,
+              type: isFirst ? 'root' : isLast ? 'leaf' : 'branch',
+            });
+            if (prevId !== null) graph.addEdge(prevId, nid);
+            prevId = nid;
+          }
+        }
+
+        // Connect nearby endpoints for clustering effect
+        const leaves = Array.from(graph.nodes.values()).filter(n => n.metadata.type === 'leaf');
+        const connectDist = trunkLength * 0.3;
+        for (let i = 0; i < leaves.length; i++) {
+          for (let j = i + 1; j < leaves.length; j++) {
+            if (leaves[i].position.distanceTo(leaves[j].position) < connectDist) {
+              graph.addEdge(leaves[i].id, leaves[j].id);
+            }
+          }
+        }
+
+        return graph;
+      }
+    }
+
+    // ─── Grid/Tiling Generator (Ringers-style) ───────────────────────
+
+    class GridTilingGenerator {
+      generate(params) {
+        const { depth, jitter, trunkLength, branchAngle, lengthRatio } = params;
+        const graph = new Graph();
+        let nodeId = 0;
+
+        const gridSize = Math.min(depth + 2, 10);
+        const cellSize = trunkLength * 0.5;
+        const layers = Math.max(1, Math.ceil(depth / 3));
+
+        // Build layered grid
+        for (let layer = 0; layer < layers; layer++) {
+          const yOffset = layer * cellSize * 2;
+          const layerNodeStart = nodeId;
+
+          // Create grid nodes
+          const gridNodes = [];
+          for (let row = 0; row < gridSize; row++) {
+            gridNodes[row] = [];
+            for (let col = 0; col < gridSize; col++) {
+              const x = (col - (gridSize - 1) / 2) * cellSize;
+              const z = (row - (gridSize - 1) / 2) * cellSize;
+              const y = yOffset;
+
+              // Apply jitter to position
+              const jx = (Math.random() - 0.5) * jitter * cellSize * 0.5;
+              const jy = (Math.random() - 0.5) * jitter * cellSize * 0.3;
+              const jz = (Math.random() - 0.5) * jitter * cellSize * 0.5;
+
+              const nid = nodeId++;
+              const isEdge = row === 0 || row === gridSize - 1 || col === 0 || col === gridSize - 1;
+              const type = layer === 0 && row === Math.floor(gridSize / 2) && col === Math.floor(gridSize / 2)
+                ? 'root'
+                : isEdge ? 'leaf' : 'branch';
+
+              graph.addNode(nid, new THREE.Vector3(x + jx, y + jy, z + jz), {
+                depth: layer * 3 + (isEdge ? 2 : 1),
+                type,
+              });
+              gridNodes[row][col] = nid;
+            }
+          }
+
+          // Connect grid cells — horizontal and vertical edges
+          for (let row = 0; row < gridSize; row++) {
+            for (let col = 0; col < gridSize; col++) {
+              if (col < gridSize - 1) {
+                graph.addEdge(gridNodes[row][col], gridNodes[row][col + 1]);
+              }
+              if (row < gridSize - 1) {
+                graph.addEdge(gridNodes[row][col], gridNodes[row + 1][col]);
+              }
+            }
+          }
+
+          // Ringers-style: remove some edges randomly based on angle parameter
+          // and add diagonal connections based on lengthRatio
+          const removalChance = (branchAngle / 90) * 0.4;
+          const diagonalChance = lengthRatio * 0.3;
+
+          // Remove random edges for visual interest
+          const edgesBefore = graph.edges.length;
+          for (let i = graph.edges.length - 1; i >= edgesBefore - (gridSize * gridSize * 2); i--) {
+            if (i < 0) break;
+            if (Math.random() < removalChance) {
+              graph.edges.splice(i, 1);
+            }
+          }
+
+          // Add some diagonal connections
+          for (let row = 0; row < gridSize - 1; row++) {
+            for (let col = 0; col < gridSize - 1; col++) {
+              if (Math.random() < diagonalChance) {
+                if (Math.random() < 0.5) {
+                  graph.addEdge(gridNodes[row][col], gridNodes[row + 1][col + 1]);
+                } else {
+                  graph.addEdge(gridNodes[row + 1][col], gridNodes[row][col + 1]);
+                }
+              }
+            }
+          }
+
+          // Connect layers vertically
+          if (layer > 0) {
+            const prevLayerStart = layerNodeStart - gridSize * gridSize;
+            for (let i = 0; i < gridSize * gridSize; i++) {
+              if (Math.random() < 0.3 + lengthRatio * 0.3) {
+                graph.addEdge(prevLayerStart + i, layerNodeStart + i);
+              }
+            }
+          }
+        }
+
+        return graph;
+      }
+    }
+
+    // ─── Noise-Based Generation ───────────────────────────────────────
+
+    class NoiseGenerator {
+      generate(params) {
+        const { depth, jitter, trunkLength, branchAngle, lengthRatio } = params;
+        const graph = new Graph();
+        let nodeId = 0;
+
+        // Perlin-like noise via layered sinusoids (3 octaves)
+        const noise2 = (x, y) => {
+          let val = 0, amp = 1, freq = 1, max = 0;
+          for (let o = 0; o < 3; o++) {
+            val += Math.sin(x * freq * 1.7 + y * freq * 0.9 + o * 5.1) *
+                   Math.cos(x * freq * 0.8 + y * freq * 2.3 + o * 3.7) * amp;
+            max += amp;
+            amp *= 0.5;
+            freq *= 2.0;
+          }
+          return val / max;
+        };
+
+        const resolution = Math.min(depth * 4 + 4, 36);
+        const extent = trunkLength * 1.5;
+        const noiseFreq = 0.3 + (1 - lengthRatio) * 0.4;
+        const heightScale = trunkLength * 1.2;
+        const threshold = (branchAngle / 90) * 0.5 - 0.1; // Controls density via angle param
+
+        // Generate nodes on a noise-driven height field
+        const grid = [];
+        for (let row = 0; row < resolution; row++) {
+          grid[row] = [];
+          for (let col = 0; col < resolution; col++) {
+            const x = (col / (resolution - 1) - 0.5) * extent * 2;
+            const z = (row / (resolution - 1) - 0.5) * extent * 2;
+            const n = noise2(x * noiseFreq, z * noiseFreq);
+
+            // Only place nodes where noise exceeds threshold
+            if (n < threshold) {
+              grid[row][col] = -1;
+              continue;
+            }
+
+            const y = n * heightScale;
+            const jx = (Math.random() - 0.5) * jitter * (extent / resolution);
+            const jz = (Math.random() - 0.5) * jitter * (extent / resolution);
+            const jy = (Math.random() - 0.5) * jitter * heightScale * 0.1;
+
+            const nid = nodeId++;
+            const distFromCenter = Math.sqrt(x * x + z * z) / extent;
+            const type = distFromCenter < 0.15 ? 'root' : n > 0.6 ? 'leaf' : 'branch';
+
+            graph.addNode(nid, new THREE.Vector3(x + jx, y + jy, z + jz), {
+              depth: Math.floor(Math.abs(n) * depth),
+              type,
+            });
+            grid[row][col] = nid;
+          }
+        }
+
+        // Connect adjacent nodes in grid
+        for (let row = 0; row < resolution; row++) {
+          for (let col = 0; col < resolution; col++) {
+            if (grid[row][col] < 0) continue;
+            const nid = grid[row][col];
+
+            // Right neighbor
+            if (col < resolution - 1 && grid[row][col + 1] >= 0) {
+              graph.addEdge(nid, grid[row][col + 1]);
+            }
+            // Down neighbor
+            if (row < resolution - 1 && grid[row + 1][col] >= 0) {
+              graph.addEdge(nid, grid[row + 1][col]);
+            }
+            // Diagonal (noise-dependent)
+            if (row < resolution - 1 && col < resolution - 1 && grid[row + 1][col + 1] >= 0) {
+              const here = graph.getNode(nid);
+              const there = graph.getNode(grid[row + 1][col + 1]);
+              const heightDiff = Math.abs(here.position.y - there.position.y);
+              if (heightDiff < heightScale * 0.3) {
+                graph.addEdge(nid, grid[row + 1][col + 1]);
+              }
+            }
+          }
+        }
+
+        // Ensure at least one root exists
+        if (graph.nodes.size > 0) {
+          let hasRoot = false;
+          for (const [, n] of graph.nodes) {
+            if (n.metadata.type === 'root') { hasRoot = true; break; }
+          }
+          if (!hasRoot) {
+            const first = graph.nodes.values().next().value;
+            first.metadata.type = 'root';
+          }
+        }
+
+        return graph;
+      }
+    }
+
+    // ─── Node Renderer (InstancedMesh) ──────────────────────────────────
+
+    class NodeRenderer {
+      constructor(scene) {
+        this.scene = scene;
+        this.mesh = null;
+        this.nodeIds = [];
+        this.dummy = new THREE.Object3D();
+        this.geometries = {
+          sphere: new THREE.SphereGeometry(1, 16, 12),
+          cube: new THREE.BoxGeometry(1, 1, 1),
+          octahedron: new THREE.OctahedronGeometry(1),
+        };
+      }
+
+      update(graph, params) {
+        this.dispose();
+
+        const { shape, size, color, opacity, emissive, emissiveIntensity, colorByDepth, leafColor } = params;
+        const geo = this.geometries[shape] || this.geometries.sphere;
+        const mat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(color),
+          transparent: opacity < 1,
+          opacity,
+          emissive: new THREE.Color(emissive),
+          emissiveIntensity,
+        });
+
+        const count = graph.nodes.size;
+        if (count === 0) return;
+
+        this.mesh = new THREE.InstancedMesh(geo, mat, count);
+        this.nodeIds = [];
+
+        const baseColor = new THREE.Color(color);
+        const tipColor = new THREE.Color(leafColor || color);
+        let maxDepth = 0;
+        for (const [, node] of graph.nodes) {
+          maxDepth = Math.max(maxDepth, node.metadata.depth || 0);
+        }
+
+        let i = 0;
+        for (const [id, node] of graph.nodes) {
+          this.dummy.position.copy(node.position);
+          const depthRatio = maxDepth > 0 ? (node.metadata.depth || 0) / maxDepth : 0;
+          const scale = node.metadata.type === 'leaf' ? 0.5 : 1 - depthRatio * 0.4;
+          this.dummy.scale.setScalar(size * Math.max(0.2, scale));
+          this.dummy.updateMatrix();
+          this.mesh.setMatrixAt(i, this.dummy.matrix);
+
+          if (colorByDepth && maxDepth > 0) {
+            const c = baseColor.clone().lerp(tipColor, depthRatio);
+            this.mesh.setColorAt(i, c);
+          } else {
+            this.mesh.setColorAt(i, baseColor);
+          }
+
+          this.nodeIds.push(id);
+          i++;
+        }
+
+        this.mesh.instanceMatrix.needsUpdate = true;
+        if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+        this.scene.add(this.mesh);
+      }
+
+      getNodeIdAtIndex(index) {
+        return this.nodeIds[index];
+      }
+
+      getIndexForNodeId(id) {
+        return this.nodeIds.indexOf(id);
+      }
+
+      dispose() {
+        if (this.mesh) {
+          this.scene.remove(this.mesh);
+          this.mesh.material.dispose();
+          this.mesh.dispose(); // Free instanceMatrix/instanceColor GPU buffers
+          this.mesh = null;
+          this.nodeIds = [];
+        }
+      }
+    }
+
+    // ─── Edge Renderer (Bezier Tubes) ───────────────────────────────────
+
+    class EdgeRenderer {
+      constructor(scene) {
+        this.scene = scene;
+        this.group = new THREE.Group();
+        this.scene.add(this.group);
+      }
+
+      update(graph, params) {
+        this.dispose();
+
+        const { thickness, color, opacity, curvature } = params;
+        const mat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(color),
+          transparent: opacity < 1,
+          opacity,
+        });
+
+        // Seed random for consistent curvature on same graph
+        let seed = 42;
+        const seededRandom = () => {
+          seed = (seed * 16807 + 0) % 2147483647;
+          return (seed - 1) / 2147483646;
+        };
+
+        for (const edge of graph.edges) {
+          const srcNode = graph.getNode(edge.source);
+          const tgtNode = graph.getNode(edge.target);
+          if (!srcNode || !tgtNode) continue;
+
+          const start = srcNode.position;
+          const end = tgtNode.position;
+          const mid = start.clone().lerp(end, 0.5);
+
+          if (curvature > 0.01) {
+            const len = start.distanceTo(end);
+            mid.x += (seededRandom() - 0.5) * curvature * len * 0.3;
+            mid.y += (seededRandom() - 0.5) * curvature * len * 0.15;
+            mid.z += (seededRandom() - 0.5) * curvature * len * 0.3;
+          }
+
+          const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
+          const segments = Math.max(4, Math.ceil(start.distanceTo(end) * 3));
+          const tubeGeo = new THREE.TubeGeometry(curve, segments, thickness, 4, false);
+          const tube = new THREE.Mesh(tubeGeo, mat);
+          tube.userData = { edge };
+          this.group.add(tube);
+        }
+      }
+
+      setHighlight(edgeIndices, highlightColor) {
+        const hc = new THREE.Color(highlightColor);
+        this.group.children.forEach((tube, i) => {
+          if (edgeIndices.includes(i)) {
+            tube.material = tube.material.clone();
+            tube.material.color.copy(hc);
+            tube.material.emissive.copy(hc);
+            tube.material.emissiveIntensity = 0.3;
+          }
+        });
+      }
+
+      dispose() {
+        while (this.group.children.length) {
+          const child = this.group.children[0];
+          child.geometry.dispose();
+          // Only dispose if it's a unique material (highlighted)
+          child.material.dispose();
+          this.group.remove(child);
+        }
+      }
+    }
+
+    // ─── Interaction Manager ────────────────────────────────────────────
+
+    class InteractionManager {
+      constructor(app) {
+        this.app = app;
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+        this.tooltip = document.getElementById('tooltip');
+        this.highlightedNodeId = null;
+
+        window.addEventListener('mousemove', e => this.onMouseMove(e));
+        window.addEventListener('click', e => this.onClick(e));
+      }
+
+      onMouseMove(e) {
+        this.mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+        this.mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.app.camera);
+        const mesh = this.app.nodeRenderer.mesh;
+        if (!mesh) { this.tooltip.style.display = 'none'; return; }
+
+        const hits = this.raycaster.intersectObject(mesh);
+        if (hits.length > 0) {
+          const idx = hits[0].instanceId;
+          const nodeId = this.app.nodeRenderer.getNodeIdAtIndex(idx);
+          const node = this.app.graph.getNode(nodeId);
+          if (node) {
+            this.tooltip.style.display = 'block';
+            this.tooltip.style.left = Math.min(e.clientX + 15, window.innerWidth - 300) + 'px';
+            this.tooltip.style.top = Math.min(e.clientY + 15, window.innerHeight - 100) + 'px';
+            const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+            let html = `<div><span class="key">id:</span> <span class="val">${esc(node.id)}</span></div>`;
+            for (const [k, v] of Object.entries(node.metadata)) {
+              html += `<div><span class="key">${esc(k)}:</span> <span class="val">${esc(v)}</span></div>`;
+            }
+            this.tooltip.innerHTML = html;
+          }
+        } else {
+          this.tooltip.style.display = 'none';
+        }
+      }
+
+      onClick(e) {
+        // Ignore clicks on GUI
+        if (e.target.closest('.lil-gui')) return;
+
+        this.raycaster.setFromCamera(this.mouse, this.app.camera);
+        const mesh = this.app.nodeRenderer.mesh;
+        if (!mesh) return;
+
+        const hits = this.raycaster.intersectObject(mesh);
+        if (hits.length > 0) {
+          const idx = hits[0].instanceId;
+          const nodeId = this.app.nodeRenderer.getNodeIdAtIndex(idx);
+          this.highlightNode(nodeId);
+        } else {
+          this.clearHighlight();
+        }
+      }
+
+      highlightNode(nodeId) {
+        this.clearHighlight();
+        this.highlightedNodeId = nodeId;
+        const mesh = this.app.nodeRenderer.mesh;
+        if (!mesh || !mesh.instanceColor) return;
+
+        const neighborIds = this.app.graph.getNeighborIds(nodeId);
+        const highlightMain = new THREE.Color(0xff3300);
+        const highlightNeighbor = new THREE.Color(0xff6600);
+
+        for (let i = 0; i < this.app.nodeRenderer.nodeIds.length; i++) {
+          const nid = this.app.nodeRenderer.nodeIds[i];
+          if (nid === nodeId) {
+            mesh.setColorAt(i, highlightMain);
+          } else if (neighborIds.has(nid)) {
+            mesh.setColorAt(i, highlightNeighbor);
+          }
+        }
+        mesh.instanceColor.needsUpdate = true;
+
+        // Highlight connected edges
+        const edgeIndices = this.app.graph.getConnectedEdgeIndices(nodeId);
+        this.app.edgeRenderer.setHighlight(edgeIndices, '#ff6600');
+      }
+
+      clearHighlight() {
+        if (this.highlightedNodeId === null) return;
+        this.highlightedNodeId = null;
+        this.app.updateVisuals();
+      }
+    }
+
+    // ─── GUI Manager ────────────────────────────────────────────────────
+
+    class GUIManager {
+      constructor(app) {
+        this.app = app;
+        this.gui = new GUI({ title: 'Node Pathway Visualizer', width: 300 });
+        this.buildStructureFolder();
+        this.buildNodeFolder();
+        this.buildEdgeFolder();
+        this.buildEnvironmentFolder();
+        this.buildIOFolder();
+      }
+
+      buildStructureFolder() {
+        const f = this.gui.addFolder('Tree Structure');
+        f.add(this.app.treeParams, 'algorithm', ['recursive', 'lsystem', 'colonization', 'flowfield', 'particles', 'grid', 'noise'])
+          .name('Algorithm').onChange(() => this.app.regenerate());
+        f.add(this.app.treeParams, 'depth', 1, 10, 1)
+          .name('Depth').onChange(() => this.app.regenerate());
+        f.add(this.app.treeParams, 'branchAngle', 5, 90)
+          .name('Branch Angle').onChange(() => this.app.regenerate());
+        f.add(this.app.treeParams, 'lengthRatio', 0.3, 0.95)
+          .name('Length Ratio').onChange(() => this.app.regenerate());
+        f.add(this.app.treeParams, 'childrenCount', 2, 5, 1)
+          .name('Children').onChange(() => this.app.regenerate());
+        f.add(this.app.treeParams, 'jitter', 0, 1)
+          .name('Randomness').onChange(() => this.app.regenerate());
+        f.add(this.app.treeParams, 'trunkLength', 1, 10)
+          .name('Trunk Length').onChange(() => this.app.regenerate());
+      }
+
+      buildNodeFolder() {
+        const f = this.gui.addFolder('Nodes');
+        f.add(this.app.nodeParams, 'shape', ['sphere', 'cube', 'octahedron'])
+          .name('Shape').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'size', 0.02, 0.5)
+          .name('Size').onChange(() => this.app.updateVisuals());
+        f.addColor(this.app.nodeParams, 'color')
+          .name('Color').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'opacity', 0, 1)
+          .name('Opacity').onChange(() => this.app.updateVisuals());
+        f.addColor(this.app.nodeParams, 'emissive')
+          .name('Emissive').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'emissiveIntensity', 0, 2)
+          .name('Glow').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'colorByDepth')
+          .name('Color by Depth').onChange(() => this.app.updateVisuals());
+        f.addColor(this.app.nodeParams, 'leafColor')
+          .name('Leaf Color').onChange(() => this.app.updateVisuals());
+      }
+
+      buildEdgeFolder() {
+        const f = this.gui.addFolder('Pathways');
+        f.add(this.app.edgeParams, 'thickness', 0.005, 0.1)
+          .name('Thickness').onChange(() => this.app.updateVisuals());
+        f.addColor(this.app.edgeParams, 'color')
+          .name('Color').onChange(() => this.app.updateVisuals());
+        f.add(this.app.edgeParams, 'opacity', 0, 1)
+          .name('Opacity').onChange(() => this.app.updateVisuals());
+        f.add(this.app.edgeParams, 'curvature', 0, 2)
+          .name('Curvature').onChange(() => this.app.updateVisuals());
+      }
+
+      buildEnvironmentFolder() {
+        const f = this.gui.addFolder('Environment');
+        f.addColor(this.app.envParams, 'background')
+          .name('Background').onChange(v => this.app.scene.background.set(v));
+        f.addColor(this.app.envParams, 'lightColor')
+          .name('Light Color').onChange(v => this.app.dirLight.color.set(v));
+        f.add(this.app.envParams, 'lightIntensity', 0, 3)
+          .name('Light Intensity').onChange(v => this.app.dirLight.intensity = v);
+        f.add(this.app.envParams, 'ambientIntensity', 0, 2)
+          .name('Ambient').onChange(v => this.app.ambientLight.intensity = v);
+        f.add(this.app.envParams, 'fogDensity', 0, 0.05)
+          .name('Fog').onChange(v => {
+            this.app.scene.fog = v > 0
+              ? new THREE.FogExp2(this.app.envParams.background, v)
+              : null;
+          });
+        f.add(this.app.envParams, 'bloom', 0, 2)
+          .name('Bloom').onChange(() => this.app.updatePostProcessing());
+        f.close();
+      }
+
+      buildIOFolder() {
+        const f = this.gui.addFolder('Import / Export');
+        f.add({ export: () => this.app.exportJSON() }, 'export').name('Export JSON');
+        f.add({ import: () => document.getElementById('fileInput').click() }, 'import').name('Import JSON');
+        f.close();
+      }
+
+      refreshDisplay() {
+        this.gui.controllersRecursive().forEach(c => c.updateDisplay());
+      }
+    }
+
+    // ─── App ────────────────────────────────────────────────────────────
+
+    class App {
+      constructor() {
+        // Parameters
+        this.treeParams = {
+          algorithm: 'recursive',
+          depth: 6,
+          branchAngle: 30,
+          lengthRatio: 0.7,
+          childrenCount: 3,
+          jitter: 0.3,
+          trunkLength: 3,
+        };
+
+        this.nodeParams = {
+          shape: 'sphere',
+          size: 0.12,
+          color: '#555555',
+          opacity: 1.0,
+          emissive: '#000000',
+          emissiveIntensity: 0.0,
+          colorByDepth: true,
+          leafColor: '#88aacc',
+        };
+
+        this.edgeParams = {
+          thickness: 0.02,
+          color: '#999999',
+          opacity: 0.8,
+          curvature: 0.3,
+        };
+
+        this.envParams = {
+          background: '#f5f5f5',
+          lightColor: '#ffffff',
+          lightIntensity: 0.8,
+          ambientIntensity: 0.6,
+          fogDensity: 0,
+          bloom: 0,
+        };
+
+        // Scene
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(this.envParams.background);
+
+        // Camera
+        this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 500);
+        this.camera.position.set(0, 8, 15);
+
+        // Renderer
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        this.renderer.toneMappingExposure = 1.0;
+        document.body.appendChild(this.renderer.domElement);
+
+        // Controls
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.05;
+        this.controls.minDistance = 0.1;
+        this.controls.maxDistance = 200;
+
+        // Lighting
+        this.ambientLight = new THREE.AmbientLight(0xffffff, this.envParams.ambientIntensity);
+        this.scene.add(this.ambientLight);
+
+        this.dirLight = new THREE.DirectionalLight(0xffffff, this.envParams.lightIntensity);
+        this.dirLight.position.set(5, 10, 7);
+        this.scene.add(this.dirLight);
+
+        // Grid
+        const grid = new THREE.GridHelper(40, 40, 0xdddddd, 0xeeeeee);
+        grid.material.transparent = true;
+        grid.material.opacity = 0.4;
+        this.scene.add(grid);
+
+        // Post-processing
+        this.composer = new EffectComposer(this.renderer);
+        this.composer.addPass(new RenderPass(this.scene, this.camera));
+        this.bloomPass = new UnrealBloomPass(
+          new THREE.Vector2(window.innerWidth, window.innerHeight),
+          0, 0.5, 0.5
+        );
+        this.composer.addPass(this.bloomPass);
+        this.composer.addPass(new OutputPass());
+
+        // Generators
+        this.generators = {
+          recursive: new RecursiveGenerator(),
+          lsystem: new LSystemGenerator(),
+          colonization: new SpaceColonizationGenerator(),
+          flowfield: new FlowFieldGenerator(),
+          particles: new ParticleSystemGenerator(),
+          grid: new GridTilingGenerator(),
+          noise: new NoiseGenerator(),
+        };
+
+        // Renderers
+        this.graph = new Graph();
+        this.nodeRenderer = new NodeRenderer(this.scene);
+        this.edgeRenderer = new EdgeRenderer(this.scene);
+
+        // Interaction
+        this.interaction = new InteractionManager(this);
+
+        // GUI
+        this.guiManager = new GUIManager(this);
+
+        // File input
+        document.getElementById('fileInput').addEventListener('change', e => {
+          if (e.target.files[0]) this.importJSON(e.target.files[0]);
+          e.target.value = '';
+        });
+
+        // Resize
+        window.addEventListener('resize', () => {
+          this.camera.aspect = window.innerWidth / window.innerHeight;
+          this.camera.updateProjectionMatrix();
+          this.renderer.setSize(window.innerWidth, window.innerHeight);
+          this.composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Initial generation
+        this.regenerate();
+
+        // Start animation
+        this.animate();
+      }
+
+      regenerate() {
+        const gen = this.generators[this.treeParams.algorithm];
+        if (!gen) return;
+        // Safety cap: estimate node count before generating
+        const { childrenCount, depth, algorithm } = this.treeParams;
+        if (algorithm === 'recursive') {
+          const estimated = (Math.pow(childrenCount, depth + 1) - 1) / (childrenCount - 1);
+          if (estimated > 50000) {
+            console.warn(`Skipping generation: estimated ${Math.round(estimated)} nodes exceeds 50K cap. Reduce depth or children.`);
+            return;
+          }
+        }
+        this.graph = gen.generate(this.treeParams);
+        this.updateVisuals();
+        this.fitCamera();
+      }
+
+      updateVisuals() {
+        this.nodeRenderer.update(this.graph, this.nodeParams);
+        this.edgeRenderer.update(this.graph, this.edgeParams);
+      }
+
+      updatePostProcessing() {
+        this.bloomPass.strength = this.envParams.bloom;
+      }
+
+      fitCamera() {
+        if (this.graph.nodes.size === 0) return;
+        const box = new THREE.Box3();
+        for (const [, node] of this.graph.nodes) {
+          box.expandByPoint(node.position);
+        }
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3()).length();
+        this.camera.position.copy(center).add(new THREE.Vector3(0, size * 0.3, size * 0.8));
+        this.controls.target.copy(center);
+        this.controls.update();
+      }
+
+      exportJSON() {
+        const data = {
+          version: 1,
+          graph: this.graph.toJSON(),
+          params: {
+            tree: { ...this.treeParams },
+            node: { ...this.nodeParams },
+            edge: { ...this.edgeParams },
+            env: { ...this.envParams },
+          },
+        };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'node-pathway-export.json';
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      importJSON(file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          try {
+            const data = JSON.parse(e.target.result);
+            if (data.params) {
+              Object.assign(this.treeParams, data.params.tree || {});
+              Object.assign(this.nodeParams, data.params.node || {});
+              Object.assign(this.edgeParams, data.params.edge || {});
+              Object.assign(this.envParams, data.params.env || {});
+            }
+            if (data.graph) {
+              this.graph = Graph.fromJSON(data.graph);
+            }
+            this.scene.background.set(this.envParams.background);
+            this.updatePostProcessing();
+            this.updateVisuals();
+            this.fitCamera();
+            this.guiManager.refreshDisplay();
+          } catch (err) {
+            console.error('Failed to import JSON:', err);
+          }
+        };
+        reader.readAsText(file);
+      }
+
+      animate() {
+        requestAnimationFrame(() => this.animate());
+        this.controls.update();
+        if (this.envParams.bloom > 0) {
+          this.composer.render();
+        } else {
+          this.renderer.render(this.scene, this.camera);
+        }
+      }
+    }
+
+    // ─── Launch ─────────────────────────────────────────────────────────
+
+    const app = new App();
+  </script>
+</body>
+</html>
