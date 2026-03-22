@@ -119,7 +119,7 @@
     // ─── Recursive Subdivision Generator ────────────────────────────────
 
     class RecursiveGenerator {
-      generate(params, collision) {
+      generate(params, collision, canopy) {
         const { depth, branchAngle, lengthRatio, childrenCount, jitter, trunkLength } = params;
         const graph = new Graph();
         let nextId = 0;
@@ -129,13 +129,13 @@
         if (collision) collision.register(new THREE.Vector3(0, 0, 0), rootId);
 
         this._branch(graph, rootId, new THREE.Vector3(0, 1, 0), trunkLength, 0, depth,
-          branchAngle, lengthRatio, childrenCount, jitter, () => nextId++, collision);
+          branchAngle, lengthRatio, childrenCount, jitter, () => nextId++, collision, canopy);
 
         return graph;
       }
 
       _branch(graph, parentId, direction, length, currentDepth, maxDepth,
-              angle, ratio, children, jitter, nextId, collision) {
+              angle, ratio, children, jitter, nextId, collision, canopy) {
         if (currentDepth >= maxDepth) return;
 
         const parentPos = graph.getNode(parentId).position;
@@ -146,6 +146,13 @@
             direction = collision.deflect(graph.getNode(parentId).position, direction, parentId, graph);
             endPos.copy(graph.getNode(parentId).position).add(direction.clone().multiplyScalar(length));
             if (!collision.canPlace(endPos, parentId, graph)) return;
+          }
+
+          if (canopy) {
+            const val = canopy.evaluate(endPos);
+            if (val <= 0) return;
+            direction = canopy.deflectInward(endPos, direction);
+            endPos.copy(graph.getNode(parentId).position).add(direction.clone().multiplyScalar(length));
           }
 
         const nodeId = nextId();
@@ -170,7 +177,7 @@
             .normalize();
 
           this._branch(graph, nodeId, newDir, length * ratio, currentDepth + 1, maxDepth,
-            angle, ratio, children, jitter, nextId, collision);
+            angle, ratio, children, jitter, nextId, collision, canopy);
         }
       }
     }
@@ -178,7 +185,7 @@
     // ─── L-System Generator ─────────────────────────────────────────────
 
     class LSystemGenerator {
-      generate(params, collision) {
+      generate(params, collision, canopy) {
         const { depth, branchAngle, lengthRatio, jitter, trunkLength } = params;
         const axiom = 'F';
         const rules = { 'F': 'F[&+F]F[-\\F][^/F]' };
@@ -215,6 +222,12 @@
                 dir = collision.deflect(pos, dir, parentId, graph);
                 newPos = pos.clone().add(dir.clone().multiplyScalar(len));
                 if (!collision.canPlace(newPos, parentId, graph)) break;
+              }
+              if (canopy) {
+                const val = canopy.evaluate(newPos);
+                if (val <= 0) break;
+                dir = canopy.deflectInward(newPos, dir);
+                newPos = pos.clone().add(dir.clone().multiplyScalar(len));
               }
               const nid = nodeId++;
               graph.addNode(nid, newPos, { depth: stack.length, type: 'branch' });
@@ -264,7 +277,7 @@
     // ─── Space Colonization Generator ───────────────────────────────────
 
     class SpaceColonizationGenerator {
-      generate(params, collision) {
+      generate(params, collision, canopy) {
         const { depth, jitter, trunkLength } = params;
         const graph = new Graph();
         let nodeId = 0;
@@ -274,16 +287,20 @@
         const attractorCount = Math.min(depth * 50, 500);
         const attractors = [];
 
-        for (let i = 0; i < attractorCount; i++) {
+        let ai = 0;
+        while (ai < attractorCount) {
           const u = Math.random(), v = Math.random();
           const theta = 2 * Math.PI * u;
           const phi = Math.acos(2 * v - 1);
           const r = crownRadius * Math.cbrt(Math.random());
-          attractors.push(new THREE.Vector3(
+          const pt = new THREE.Vector3(
             r * Math.sin(phi) * Math.cos(theta),
             r * Math.sin(phi) * Math.sin(theta),
             r * Math.cos(phi)
-          ).add(crownCenter));
+          ).add(crownCenter);
+          if (canopy && canopy.enabled && canopy.evaluate(pt) <= 0) continue;
+          attractors.push(pt);
+          ai++;
         }
 
         const trunkSteps = 5;
@@ -332,6 +349,13 @@
             const parentPos = graph.getNode(nid).position;
             if (collision && collision.enabled) {
               avg = collision.deflect(parentPos, avg, nid, graph);
+            }
+
+            if (canopy) {
+              const testPos = parentPos.clone().add(avg.clone().multiplyScalar(segmentLength));
+              const val = canopy.evaluate(testPos);
+              if (val <= 0) continue;
+              avg = canopy.deflectInward(testPos, avg);
             }
 
             const newPos = parentPos.clone().add(avg.multiplyScalar(segmentLength));
@@ -1387,6 +1411,16 @@
           deflectionStrength: 0.8,
         };
 
+        this.canopyParams = {
+          enabled: false,
+          shape: 'ellipsoid',
+          width: 8,
+          height: 10,
+          centerY: 5,
+          softness: 0.3,
+          showPreview: false,
+        };
+
         // Scene
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(this.envParams.background);
@@ -1446,6 +1480,7 @@
         };
 
         this.collisionSystem = new CollisionSystem();
+        this.canopyShape = new CanopyShape();
 
         // Renderers
         this.graph = new Graph();
@@ -1497,7 +1532,10 @@
         this.collisionSystem.deflectionStrength = this.collisionParams.deflectionStrength;
         this.collisionSystem.init(this.collisionParams.minSpacing);
 
-        this.graph = gen.generate(this.treeParams, this.collisionSystem);
+        // Setup canopy shape
+        Object.assign(this.canopyShape, this.canopyParams);
+
+        this.graph = gen.generate(this.treeParams, this.collisionSystem, this.canopyShape);
         this.updateVisuals();
         this.fitCamera();
       }
