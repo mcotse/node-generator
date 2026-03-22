@@ -1076,6 +1076,10 @@
           opacity,
           emissive: new THREE.Color(emissive),
           emissiveIntensity,
+          metalness: params.metalness,
+          roughness: params.roughness,
+          wireframe: params.wireframe,
+          flatShading: params.flatShading,
         });
 
         const setInstance = (mesh, instanceIdx, node, id) => {
@@ -1213,6 +1217,9 @@
           color: new THREE.Color(color),
           transparent: opacity < 1,
           opacity,
+          metalness: params.metalness || 0,
+          roughness: params.roughness || 0.5,
+          wireframe: params.wireframe || false,
         });
 
         // Seed random for consistent curvature on same graph
@@ -1504,6 +1511,14 @@
           .name('Color by Depth').onChange(() => this.app.updateVisuals());
         f.addColor(this.app.nodeParams, 'leafColor')
           .name('Leaf Color').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'metalness', 0, 1)
+          .name('Metalness').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'roughness', 0, 1)
+          .name('Roughness').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'wireframe')
+          .name('Wireframe').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'flatShading')
+          .name('Flat Shading').onChange(() => this.app.updateVisuals());
       }
 
       buildEdgeFolder() {
@@ -1516,6 +1531,8 @@
           .name('Opacity').onChange(() => this.app.updateVisuals());
         f.add(this.app.edgeParams, 'curvature', 0, 2)
           .name('Curvature').onChange(() => this.app.updateVisuals());
+        f.add(this.app.edgeParams, 'wireframe')
+          .name('Wireframe').onChange(() => this.app.updateVisuals());
       }
 
       buildEnvironmentFolder() {
@@ -1585,6 +1602,10 @@
           rootShape: 'icosahedron',
           branchShape: 'sphere',
           leafShape: 'diamond',
+          metalness: 0.0,
+          roughness: 0.7,
+          wireframe: false,
+          flatShading: false,
         };
 
         this.edgeParams = {
@@ -1592,6 +1613,9 @@
           color: '#999999',
           opacity: 0.8,
           curvature: 0.3,
+          metalness: 0.0,
+          roughness: 0.5,
+          wireframe: false,
         };
 
         this.envParams = {
