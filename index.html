@@ -44,6 +44,7 @@
     import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
     import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
     import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+    import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
     import GUI from 'lil-gui';
 
     // ─── Graph Data Model ───────────────────────────────────────────────
@@ -456,6 +457,74 @@
 
       clear() {
         if (this.index) this.index.clear();
+      }
+    }
+
+    // ─── Canopy Shape (Bounding Envelope) ─────────────────────────────
+    class CanopyShape {
+      constructor() {
+        this.enabled = false;
+        this.shape = 'sphere';
+        this.width = 8;
+        this.height = 10;
+        this.centerY = 5;
+        this.softness = 0.3;
+      }
+
+      evaluate(point) {
+        if (!this.enabled) return 1.0;
+
+        const px = point.x;
+        const py = point.y - this.centerY;
+        const pz = point.z;
+        let t;
+
+        switch (this.shape) {
+          case 'sphere': {
+            const r = this.width;
+            t = Math.sqrt(px * px + py * py + pz * pz) / r;
+            break;
+          }
+          case 'ellipsoid': {
+            const rx = this.width, ry = this.height / 2, rz = this.width;
+            t = Math.sqrt((px / rx) ** 2 + (py / ry) ** 2 + (pz / rz) ** 2);
+            break;
+          }
+          case 'cone': {
+            const h = this.height;
+            const normalizedY = (py + h / 2) / h;
+            if (normalizedY < 0 || normalizedY > 1) return 0;
+            const radiusAtY = this.width * (1 - normalizedY);
+            const distXZ = Math.sqrt(px * px + pz * pz);
+            t = radiusAtY > 0 ? distXZ / radiusAtY : (distXZ > 0 ? 2 : 0);
+            break;
+          }
+          case 'cylinder': {
+            const distXZ = Math.sqrt(px * px + pz * pz);
+            const tXZ = distXZ / this.width;
+            const tY = Math.abs(py) / (this.height / 2);
+            t = Math.max(tXZ, tY);
+            break;
+          }
+          default:
+            return 1.0;
+        }
+
+        if (t <= 1.0 - this.softness) return 1.0;
+        if (t >= 1.0) return 0.0;
+        const blend = (t - (1.0 - this.softness)) / this.softness;
+        return 1.0 - blend * blend;
+      }
+
+      deflectInward(point, direction) {
+        if (!this.enabled) return direction.clone();
+        const val = this.evaluate(point);
+        if (val > 0.5) return direction.clone();
+
+        const center = new THREE.Vector3(0, this.centerY, 0);
+        const toCenter = center.clone().sub(point).normalize();
+        const strength = 1.0 - val;
+        return direction.clone().lerp(toCenter, strength * 0.6).normalize();
       }
     }
 
@@ -962,13 +1031,16 @@
         this.scene = scene;
         this.group = new THREE.Group();
         this.scene.add(this.group);
+        this.mergedMesh = null;
+        this.material = null;
+        this.edgeVertexRanges = []; // track vertex ranges per edge for highlighting
       }
 
       update(graph, params) {
         this.dispose();
 
         const { thickness, color, opacity, curvature } = params;
-        const mat = new THREE.MeshStandardMaterial({
+        this.material = new THREE.MeshStandardMaterial({
           color: new THREE.Color(color),
           transparent: opacity < 1,
           opacity,
@@ -980,6 +1052,10 @@
           seed = (seed * 16807 + 0) % 2147483647;
           return (seed - 1) / 2147483646;
         };
+
+        const geometries = [];
+        this.edgeVertexRanges = [];
+        let vertexOffset = 0;
 
         for (const edge of graph.edges) {
           const srcNode = graph.getNode(edge.source);
@@ -1000,32 +1076,65 @@
           const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
           const segments = Math.max(4, Math.ceil(start.distanceTo(end) * 3));
           const tubeGeo = new THREE.TubeGeometry(curve, segments, thickness, 4, false);
-          const tube = new THREE.Mesh(tubeGeo, mat);
-          tube.userData = { edge };
-          this.group.add(tube);
+
+          const vertexCount = tubeGeo.attributes.position.count;
+          this.edgeVertexRanges.push({ start: vertexOffset, count: vertexCount });
+          vertexOffset += vertexCount;
+
+          geometries.push(tubeGeo);
+        }
+
+        if (geometries.length > 0) {
+          const merged = mergeGeometries(geometries);
+          if (merged) {
+            this.mergedMesh = new THREE.Mesh(merged, this.material);
+            this.group.add(this.mergedMesh);
+          }
+          for (const geo of geometries) geo.dispose();
         }
       }
 
       setHighlight(edgeIndices, highlightColor) {
+        if (!this.mergedMesh) return;
+        const geo = this.mergedMesh.geometry;
+        const colors = geo.attributes.color
+          || new THREE.BufferAttribute(new Float32Array(geo.attributes.position.count * 3), 3);
+
+        // Fill with base material color
+        const base = this.material.color;
+        for (let i = 0; i < colors.count; i++) {
+          colors.setXYZ(i, base.r, base.g, base.b);
+        }
+
+        // Highlight selected edges
         const hc = new THREE.Color(highlightColor);
-        this.group.children.forEach((tube, i) => {
-          if (edgeIndices.includes(i)) {
-            tube.material = tube.material.clone();
-            tube.material.color.copy(hc);
-            tube.material.emissive.copy(hc);
-            tube.material.emissiveIntensity = 0.3;
+        for (const ei of edgeIndices) {
+          if (ei < this.edgeVertexRanges.length) {
+            const range = this.edgeVertexRanges[ei];
+            for (let v = range.start; v < range.start + range.count; v++) {
+              colors.setXYZ(v, hc.r, hc.g, hc.b);
+            }
           }
-        });
+        }
+
+        colors.needsUpdate = true;
+        geo.setAttribute('color', colors);
+        this.mergedMesh.material = this.material.clone();
+        this.mergedMesh.material.vertexColors = true;
       }
 
       dispose() {
-        while (this.group.children.length) {
-          const child = this.group.children[0];
-          child.geometry.dispose();
-          // Only dispose if it's a unique material (highlighted)
-          child.material.dispose();
-          this.group.remove(child);
+        if (this.mergedMesh) {
+          this.mergedMesh.geometry.dispose();
+          this.mergedMesh.material.dispose();
+          this.group.remove(this.mergedMesh);
+          this.mergedMesh = null;
         }
+        if (this.material) {
+          this.material.dispose();
+          this.material = null;
+        }
+        this.edgeVertexRanges = [];
       }
     }
 
@@ -1129,6 +1238,7 @@
         this.app = app;
         this.gui = new GUI({ title: 'Node Pathway Visualizer', width: 300 });
         this.buildStructureFolder();
+        this.buildCollisionFolder();
         this.buildNodeFolder();
         this.buildEdgeFolder();
         this.buildEnvironmentFolder();
@@ -1151,6 +1261,17 @@
           .name('Randomness').onChange(() => this.app.regenerate());
         f.add(this.app.treeParams, 'trunkLength', 1, 10)
           .name('Trunk Length').onChange(() => this.app.regenerate());
+      }
+
+      buildCollisionFolder() {
+        const f = this.gui.addFolder('Spacing');
+        f.add(this.app.collisionParams, 'enabled')
+          .name('Collision Avoidance').onChange(() => this.app.regenerate());
+        f.add(this.app.collisionParams, 'minSpacing', 0.1, 3.0)
+          .name('Min Spacing').onChange(() => this.app.regenerate());
+        f.add(this.app.collisionParams, 'deflectionStrength', 0, 2)
+          .name('Deflection').onChange(() => this.app.regenerate());
+        f.close();
       }
 
       buildNodeFolder() {
@@ -1412,6 +1533,7 @@
             node: { ...this.nodeParams },
             edge: { ...this.edgeParams },
             env: { ...this.envParams },
+            collision: { ...this.collisionParams },
           },
         };
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1433,6 +1555,7 @@
               Object.assign(this.nodeParams, data.params.node || {});
               Object.assign(this.edgeParams, data.params.edge || {});
               Object.assign(this.envParams, data.params.env || {});
+              Object.assign(this.collisionParams, data.params.collision || {});
             }
             if (data.graph) {
               this.graph = Graph.fromJSON(data.graph);
