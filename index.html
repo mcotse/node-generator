@@ -1103,6 +1103,7 @@
           const geo = this.geometries[shape] || this.geometries.sphere;
           const mat = makeMaterial();
           const mesh = new THREE.InstancedMesh(geo, mat, count);
+          mesh.castShadow = true;
           const ids = [];
 
           let i = 0;
@@ -1141,6 +1142,7 @@
             const geo = this.geometries[shapeName] || this.geometries.sphere;
             const mat = makeMaterial();
             const mesh = new THREE.InstancedMesh(geo, mat, nodes.length);
+            mesh.castShadow = true;
             const ids = [];
 
             for (let i = 0; i < nodes.length; i++) {
@@ -1591,6 +1593,17 @@
           });
         f.add(this.app.envParams, 'bloom', 0, 2)
           .name('Bloom').onChange(() => this.app.updatePostProcessing());
+        f.add(this.app.envParams, 'shadows').name('Shadows').onChange(v => {
+          this.app.renderer.shadowMap.enabled = v;
+          this.app.groundPlane.visible = v;
+          // Shadow toggle requires material recompile on all scene materials
+          this.app.scene.traverse(obj => {
+            if (obj.material) obj.material.needsUpdate = true;
+          });
+          this.app.updateVisuals();
+        });
+        f.add(this.app.envParams, 'autoOrbit').name('Auto Orbit');
+        f.add(this.app.envParams, 'autoOrbitSpeed', 0.1, 3).name('Orbit Speed');
         f.close();
       }
 
@@ -1667,6 +1680,9 @@
           ambientIntensity: 0.6,
           fogDensity: 0,
           bloom: 0,
+          shadows: false,
+          autoOrbit: false,
+          autoOrbitSpeed: 0.3,
         };
 
         this.collisionParams = {
@@ -1704,6 +1720,8 @@
         this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
         this.renderer.toneMappingExposure = 1.0;
+        this.renderer.shadowMap.enabled = false; // toggled by param
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
         document.body.appendChild(this.renderer.domElement);
 
         // Controls
@@ -1719,6 +1737,14 @@
 
         this.dirLight = new THREE.DirectionalLight(0xffffff, this.envParams.lightIntensity);
         this.dirLight.position.set(5, 10, 7);
+        this.dirLight.castShadow = true;
+        this.dirLight.shadow.mapSize.set(1024, 1024);
+        this.dirLight.shadow.camera.near = 0.5;
+        this.dirLight.shadow.camera.far = 100;
+        this.dirLight.shadow.camera.left = -20;
+        this.dirLight.shadow.camera.right = 20;
+        this.dirLight.shadow.camera.top = 20;
+        this.dirLight.shadow.camera.bottom = -20;
         this.scene.add(this.dirLight);
 
         // Grid
@@ -1726,6 +1752,15 @@
         grid.material.transparent = true;
         grid.material.opacity = 0.4;
         this.scene.add(grid);
+
+        // Ground plane for shadow receiving
+        const groundGeo = new THREE.PlaneGeometry(80, 80);
+        const groundMat = new THREE.ShadowMaterial({ opacity: 0.15 });
+        this.groundPlane = new THREE.Mesh(groundGeo, groundMat);
+        this.groundPlane.rotation.x = -Math.PI / 2;
+        this.groundPlane.receiveShadow = true;
+        this.groundPlane.visible = false;
+        this.scene.add(this.groundPlane);
 
         // Post-processing
         this.composer = new EffectComposer(this.renderer);
@@ -1938,6 +1973,12 @@
 
       animate() {
         requestAnimationFrame(() => this.animate());
+        if (this.envParams.autoOrbit) {
+          this.controls.autoRotate = true;
+          this.controls.autoRotateSpeed = this.envParams.autoOrbitSpeed * 4;
+        } else {
+          this.controls.autoRotate = false;
+        }
         this.controls.update();
         const time = performance.now() * 0.001;
         this.nodeRenderer.tick(time, this.nodeParams);
