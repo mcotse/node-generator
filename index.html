@@ -1248,15 +1248,7 @@
       update(graph, params) {
         this.dispose();
 
-        const { thickness, color, opacity, curvature } = params;
-        this.material = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(color),
-          transparent: opacity < 1,
-          opacity,
-          metalness: params.metalness || 0,
-          roughness: params.roughness || 0.5,
-          wireframe: params.wireframe || false,
-        });
+        const { thickness, color, opacity, curvature, style, dashScale } = params;
 
         // Seed random for consistent curvature on same graph
         let seed = 42;
@@ -1265,44 +1257,90 @@
           return (seed - 1) / 2147483646;
         };
 
-        const geometries = [];
-        this.edgeVertexRanges = [];
-        let vertexOffset = 0;
+        if (style === 'dashed') {
+          const mat = new THREE.LineDashedMaterial({
+            color: new THREE.Color(color),
+            transparent: opacity < 1,
+            opacity,
+            dashSize: 0.1 * dashScale,
+            gapSize: 0.05 * dashScale,
+          });
 
-        for (const edge of graph.edges) {
-          const srcNode = graph.getNode(edge.source);
-          const tgtNode = graph.getNode(edge.target);
-          if (!srcNode || !tgtNode) continue;
+          for (const edge of graph.edges) {
+            const srcNode = graph.getNode(edge.source);
+            const tgtNode = graph.getNode(edge.target);
+            if (!srcNode || !tgtNode) continue;
 
-          const start = srcNode.position;
-          const end = tgtNode.position;
-          const mid = start.clone().lerp(end, 0.5);
+            const start = srcNode.position;
+            const end = tgtNode.position;
+            const mid = start.clone().lerp(end, 0.5);
 
-          if (curvature > 0.01) {
-            const len = start.distanceTo(end);
-            mid.x += (seededRandom() - 0.5) * curvature * len * 0.3;
-            mid.y += (seededRandom() - 0.5) * curvature * len * 0.15;
-            mid.z += (seededRandom() - 0.5) * curvature * len * 0.3;
+            if (curvature > 0.01) {
+              const len = start.distanceTo(end);
+              mid.x += (seededRandom() - 0.5) * curvature * len * 0.3;
+              mid.y += (seededRandom() - 0.5) * curvature * len * 0.15;
+              mid.z += (seededRandom() - 0.5) * curvature * len * 0.3;
+            }
+
+            const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
+            const segments = Math.max(4, Math.ceil(start.distanceTo(end) * 3));
+            const points = curve.getPoints(segments);
+            const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+            const line = new THREE.Line(lineGeo, mat.clone());
+            line.computeLineDistances(); // REQUIRED for dashes to render
+            line.userData = { edge };
+            this.group.add(line);
+          }
+        } else {
+          // Solid style: TubeGeometry + MeshStandardMaterial
+          this.material = new THREE.MeshStandardMaterial({
+            color: new THREE.Color(color),
+            transparent: opacity < 1,
+            opacity,
+            metalness: params.metalness || 0,
+            roughness: params.roughness || 0.5,
+            wireframe: params.wireframe || false,
+          });
+
+          const geometries = [];
+          this.edgeVertexRanges = [];
+          let vertexOffset = 0;
+
+          for (const edge of graph.edges) {
+            const srcNode = graph.getNode(edge.source);
+            const tgtNode = graph.getNode(edge.target);
+            if (!srcNode || !tgtNode) continue;
+
+            const start = srcNode.position;
+            const end = tgtNode.position;
+            const mid = start.clone().lerp(end, 0.5);
+
+            if (curvature > 0.01) {
+              const len = start.distanceTo(end);
+              mid.x += (seededRandom() - 0.5) * curvature * len * 0.3;
+              mid.y += (seededRandom() - 0.5) * curvature * len * 0.15;
+              mid.z += (seededRandom() - 0.5) * curvature * len * 0.3;
+            }
+
+            const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
+            const segments = Math.max(4, Math.ceil(start.distanceTo(end) * 3));
+            const tubeGeo = new THREE.TubeGeometry(curve, segments, thickness, 4, false);
+
+            const vertexCount = tubeGeo.attributes.position.count;
+            this.edgeVertexRanges.push({ start: vertexOffset, count: vertexCount });
+            vertexOffset += vertexCount;
+
+            geometries.push(tubeGeo);
           }
 
-          const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
-          const segments = Math.max(4, Math.ceil(start.distanceTo(end) * 3));
-          const tubeGeo = new THREE.TubeGeometry(curve, segments, thickness, 4, false);
-
-          const vertexCount = tubeGeo.attributes.position.count;
-          this.edgeVertexRanges.push({ start: vertexOffset, count: vertexCount });
-          vertexOffset += vertexCount;
-
-          geometries.push(tubeGeo);
-        }
-
-        if (geometries.length > 0) {
-          const merged = mergeGeometries(geometries);
-          if (merged) {
-            this.mergedMesh = new THREE.Mesh(merged, this.material);
-            this.group.add(this.mergedMesh);
+          if (geometries.length > 0) {
+            const merged = mergeGeometries(geometries);
+            if (merged) {
+              this.mergedMesh = new THREE.Mesh(merged, this.material);
+              this.group.add(this.mergedMesh);
+            }
+            for (const geo of geometries) geo.dispose();
           }
-          for (const geo of geometries) geo.dispose();
         }
       }
 
@@ -1335,12 +1373,28 @@
         this.mergedMesh.material.vertexColors = true;
       }
 
+      tick(time, params) {
+        if (!params.flowAnimate) return;
+        this.group.children.forEach(child => {
+          if (child.material && child.material.dashSize !== undefined) {
+            child.material.dashOffset = -time * params.flowSpeed;
+          }
+        });
+      }
+
       dispose() {
         if (this.mergedMesh) {
           this.mergedMesh.geometry.dispose();
           this.mergedMesh.material.dispose();
           this.group.remove(this.mergedMesh);
           this.mergedMesh = null;
+        }
+        // Dispose dashed line children
+        for (let i = this.group.children.length - 1; i >= 0; i--) {
+          const child = this.group.children[i];
+          if (child.geometry) child.geometry.dispose();
+          if (child.material) child.material.dispose();
+          this.group.remove(child);
         }
         if (this.material) {
           this.material.dispose();
@@ -1573,6 +1627,12 @@
           .name('Curvature').onChange(() => this.app.updateVisuals());
         f.add(this.app.edgeParams, 'wireframe')
           .name('Wireframe').onChange(() => this.app.updateVisuals());
+        f.add(this.app.edgeParams, 'style', ['solid', 'dashed'])
+          .name('Style').onChange(() => this.app.updateVisuals());
+        f.add(this.app.edgeParams, 'dashScale', 0.2, 3)
+          .name('Dash Scale').onChange(() => this.app.updateVisuals());
+        f.add(this.app.edgeParams, 'flowAnimate').name('Flow Animate');
+        f.add(this.app.edgeParams, 'flowSpeed', 0.1, 5).name('Flow Speed');
       }
 
       buildEnvironmentFolder() {
@@ -1671,6 +1731,10 @@
           metalness: 0.0,
           roughness: 0.5,
           wireframe: false,
+          style: 'solid',
+          dashScale: 1.0,
+          flowAnimate: false,
+          flowSpeed: 1.0,
         };
 
         this.envParams = {
@@ -1982,6 +2046,7 @@
         this.controls.update();
         const time = performance.now() * 0.001;
         this.nodeRenderer.tick(time, this.nodeParams);
+        this.edgeRenderer.tick(time, this.edgeParams);
         if (this.envParams.bloom > 0) {
           this.composer.render();
         } else {
