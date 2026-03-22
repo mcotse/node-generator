@@ -1184,6 +1184,40 @@
         return this.meshes.indexOf(mesh);
       }
 
+      tick(time, params) {
+        if (this.meshes.length === 0 || !params.animate) return;
+        const { pulseSpeed, pulseAmount, spinSpeed, size } = params;
+
+        for (let m = 0; m < this.meshes.length; m++) {
+          const mesh = this.meshes[m];
+          const nodeIdList = this.meshNodeIds[m];
+
+          for (let i = 0; i < nodeIdList.length; i++) {
+            const node = this._lastGraph.getNode(nodeIdList[i]);
+            if (!node) continue;
+
+            const depthRatio = this._maxDepth > 0 ? (node.metadata.depth || 0) / this._maxDepth : 0;
+            const baseScale = node.metadata.type === 'leaf' ? 0.5 : 1 - depthRatio * 0.4;
+
+            // Pulse: sine wave offset by depth so it ripples through the tree
+            const pulse = 1 + Math.sin(time * pulseSpeed * 3 + depthRatio * Math.PI * 2) * pulseAmount;
+
+            this.dummy.position.copy(node.position);
+            this.dummy.scale.setScalar(size * Math.max(0.2, baseScale) * pulse);
+
+            if (spinSpeed > 0) {
+              this.dummy.rotation.y = time * spinSpeed + i * 0.1;
+            } else {
+              this.dummy.rotation.set(0, 0, 0);
+            }
+
+            this.dummy.updateMatrix();
+            mesh.setMatrixAt(i, this.dummy.matrix);
+          }
+          mesh.instanceMatrix.needsUpdate = true;
+        }
+      }
+
       dispose() {
         for (const mesh of this.meshes) {
           this.scene.remove(mesh);
@@ -1519,6 +1553,10 @@
           .name('Wireframe').onChange(() => this.app.updateVisuals());
         f.add(this.app.nodeParams, 'flatShading')
           .name('Flat Shading').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'animate').name('Animate');
+        f.add(this.app.nodeParams, 'pulseSpeed', 0.1, 5).name('Pulse Speed');
+        f.add(this.app.nodeParams, 'pulseAmount', 0, 0.5).name('Pulse Amount');
+        f.add(this.app.nodeParams, 'spinSpeed', 0, 3).name('Spin Speed');
       }
 
       buildEdgeFolder() {
@@ -1606,6 +1644,10 @@
           roughness: 0.7,
           wireframe: false,
           flatShading: false,
+          animate: false,
+          pulseSpeed: 1.0,
+          pulseAmount: 0.2,
+          spinSpeed: 0.0,
         };
 
         this.edgeParams = {
@@ -1897,6 +1939,8 @@
       animate() {
         requestAnimationFrame(() => this.animate());
         this.controls.update();
+        const time = performance.now() * 0.001;
+        this.nodeRenderer.tick(time, this.nodeParams);
         if (this.envParams.bloom > 0) {
           this.composer.render();
         } else {
