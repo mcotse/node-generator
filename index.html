@@ -1082,11 +1082,22 @@
           flatShading: params.flatShading,
         });
 
+        // Use seeded random for consistent size variation across regenerations
+        let seed = 42;
+        const seededRandom = () => {
+          seed = (seed * 16807 + 0) % 2147483647;
+          return (seed - 1) / 2147483646;
+        };
+
         const setInstance = (mesh, instanceIdx, node, id) => {
           this.dummy.position.copy(node.position);
           const depthRatio = maxDepth > 0 ? (node.metadata.depth || 0) / maxDepth : 0;
-          const scale = node.metadata.type === 'leaf' ? 0.5 : 1 - depthRatio * 0.4;
-          this.dummy.scale.setScalar(size * Math.max(0.2, scale));
+          const depthScale = params.sizeByDepth
+            ? Math.max(params.minSize, 1 - depthRatio * (1 - params.minSize))
+            : 1;
+          const variation = 1 + (seededRandom() - 0.5) * params.sizeVariation;
+          const finalScale = size * depthScale * variation;
+          this.dummy.scale.setScalar(Math.max(0.05, finalScale));
           this.dummy.updateMatrix();
           mesh.setMatrixAt(instanceIdx, this.dummy.matrix);
 
@@ -1199,13 +1210,16 @@
             if (!node) continue;
 
             const depthRatio = this._maxDepth > 0 ? (node.metadata.depth || 0) / this._maxDepth : 0;
-            const baseScale = node.metadata.type === 'leaf' ? 0.5 : 1 - depthRatio * 0.4;
+            const depthScale = params.sizeByDepth
+              ? Math.max(params.minSize || 0.3, 1 - depthRatio * (1 - (params.minSize || 0.3)))
+              : 1;
 
             // Pulse: sine wave offset by depth so it ripples through the tree
+            // Note: sizeVariation not applied in tick() to avoid per-frame random jitter
             const pulse = 1 + Math.sin(time * pulseSpeed * 3 + depthRatio * Math.PI * 2) * pulseAmount;
 
             this.dummy.position.copy(node.position);
-            this.dummy.scale.setScalar(size * Math.max(0.2, baseScale) * pulse);
+            this.dummy.scale.setScalar(size * Math.max(0.05, depthScale) * pulse);
 
             if (spinSpeed > 0) {
               this.dummy.rotation.y = time * spinSpeed + i * 0.1;
@@ -1613,6 +1627,9 @@
         f.add(this.app.nodeParams, 'pulseSpeed', 0.1, 5).name('Pulse Speed');
         f.add(this.app.nodeParams, 'pulseAmount', 0, 0.5).name('Pulse Amount');
         f.add(this.app.nodeParams, 'spinSpeed', 0, 3).name('Spin Speed');
+        f.add(this.app.nodeParams, 'sizeByDepth').name('Size by Depth').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'sizeVariation', 0, 1).name('Size Variation').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'minSize', 0.1, 1).name('Min Size').onChange(() => this.app.updateVisuals());
       }
 
       buildEdgeFolder() {
@@ -1721,6 +1738,9 @@
           pulseSpeed: 1.0,
           pulseAmount: 0.2,
           spinSpeed: 0.0,
+          sizeByDepth: true,
+          sizeVariation: 0.0,
+          minSize: 0.3,
         };
 
         this.edgeParams = {
