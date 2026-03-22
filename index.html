@@ -1609,6 +1609,15 @@
             return;
           }
         }
+        if (algorithm === 'lsystem' && depth > 6) {
+          console.warn('L-system depth capped at 7 to prevent string explosion');
+        }
+        if (algorithm === 'colonization') {
+          const estimatedMax = depth * 15 * depth * 50;
+          if (estimatedMax > 100000) {
+            console.warn(`Colonization may produce many nodes at depth ${depth}. Consider reducing.`);
+          }
+        }
         // Setup collision system
         this.collisionSystem.enabled = this.collisionParams.enabled;
         this.collisionSystem.minSpacing = this.collisionParams.minSpacing;
@@ -1621,6 +1630,7 @@
         this.graph = gen.generate(this.treeParams, this.collisionSystem, this.canopyShape);
         this.updateVisuals();
         this.fitCamera();
+        this.updateCanopyPreview();
       }
 
       updateVisuals() {
