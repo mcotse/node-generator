@@ -552,6 +552,58 @@
       }
     }
 
+    // ─── Hi-Res Exporter ──────────────────────────────────────────────
+    class HiResExporter {
+      static export(app, params) {
+        const { multiplier, transparentBg } = params;
+        const width = Math.round(window.innerWidth * multiplier);
+        const height = Math.round(window.innerHeight * multiplier);
+
+        const renderer = new THREE.WebGLRenderer({
+          antialias: true,
+          alpha: transparentBg,
+          preserveDrawingBuffer: true,
+        });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(1);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+
+        const origBg = app.scene.background;
+        if (transparentBg) app.scene.background = null;
+
+        if (app.envParams.bloom > 0) {
+          const composer = new EffectComposer(renderer);
+          composer.addPass(new RenderPass(app.scene, app.camera));
+          const bloom = new UnrealBloomPass(
+            new THREE.Vector2(width, height),
+            app.envParams.bloom, 0.5, 0.5
+          );
+          composer.addPass(bloom);
+          composer.addPass(new OutputPass());
+          composer.setSize(width, height);
+          composer.render();
+          for (const pass of composer.passes) pass.dispose();
+          composer.renderTarget1.dispose();
+          composer.renderTarget2.dispose();
+        } else {
+          renderer.render(app.scene, app.camera);
+        }
+
+        if (transparentBg) app.scene.background = origBg;
+
+        const canvas = renderer.domElement;
+        const dataUrl = canvas.toDataURL('image/png');
+        const a = document.createElement('a');
+        a.href = dataUrl;
+        const dpi = Math.round(multiplier * 96);
+        a.download = `node-pathway-${width}x${height}-${dpi}dpi.png`;
+        a.click();
+
+        renderer.dispose();
+      }
+    }
+
     // ─── Flow Field Generator ─────────────────────────────────────────
 
     class FlowFieldGenerator {
@@ -1263,6 +1315,7 @@
         this.gui = new GUI({ title: 'Node Pathway Visualizer', width: 300 });
         this.buildStructureFolder();
         this.buildCollisionFolder();
+        this.buildCanopyFolder();
         this.buildNodeFolder();
         this.buildEdgeFolder();
         this.buildEnvironmentFolder();
@@ -1295,6 +1348,25 @@
           .name('Min Spacing').onChange(() => this.app.regenerate());
         f.add(this.app.collisionParams, 'deflectionStrength', 0, 2)
           .name('Deflection').onChange(() => this.app.regenerate());
+        f.close();
+      }
+
+      buildCanopyFolder() {
+        const f = this.gui.addFolder('Canopy');
+        f.add(this.app.canopyParams, 'enabled')
+          .name('Enable Canopy').onChange(() => { this.app.regenerate(); this.app.updateCanopyPreview(); });
+        f.add(this.app.canopyParams, 'shape', ['sphere', 'ellipsoid', 'cone', 'cylinder'])
+          .name('Shape').onChange(() => { this.app.regenerate(); this.app.updateCanopyPreview(); });
+        f.add(this.app.canopyParams, 'width', 1, 20)
+          .name('Width').onChange(() => { this.app.regenerate(); this.app.updateCanopyPreview(); });
+        f.add(this.app.canopyParams, 'height', 1, 20)
+          .name('Height').onChange(() => { this.app.regenerate(); this.app.updateCanopyPreview(); });
+        f.add(this.app.canopyParams, 'centerY', 0, 15)
+          .name('Center Y').onChange(() => { this.app.regenerate(); this.app.updateCanopyPreview(); });
+        f.add(this.app.canopyParams, 'softness', 0, 1)
+          .name('Softness').onChange(() => this.app.regenerate());
+        f.add(this.app.canopyParams, 'showPreview')
+          .name('Show Boundary').onChange(() => this.app.updateCanopyPreview());
         f.close();
       }
 
@@ -1355,6 +1427,12 @@
         const f = this.gui.addFolder('Import / Export');
         f.add({ export: () => this.app.exportJSON() }, 'export').name('Export JSON');
         f.add({ import: () => document.getElementById('fileInput').click() }, 'import').name('Import JSON');
+        f.add(this.app.exportParams, 'multiplier', { '2x (Print Draft)': 2, '4x (Print Standard)': 4, '8x (Print HQ)': 8 })
+          .name('Resolution');
+        f.add(this.app.exportParams, 'transparentBg')
+          .name('Transparent BG');
+        f.add({ exportPNG: () => HiResExporter.export(this.app, this.app.exportParams) }, 'exportPNG')
+          .name('Export PNG');
         f.close();
       }
 
@@ -1419,6 +1497,11 @@
           centerY: 5,
           softness: 0.3,
           showPreview: false,
+        };
+
+        this.exportParams = {
+          multiplier: 4,
+          transparentBg: false,
         };
 
         // Scene
@@ -1549,6 +1632,50 @@
         this.bloomPass.strength = this.envParams.bloom;
       }
 
+      updateCanopyPreview() {
+        if (this.canopyPreviewMesh) {
+          this.scene.remove(this.canopyPreviewMesh);
+          this.canopyPreviewMesh.geometry.dispose();
+          this.canopyPreviewMesh.material.dispose();
+          this.canopyPreviewMesh = null;
+        }
+
+        if (!this.canopyParams.showPreview || !this.canopyParams.enabled) return;
+
+        const { shape, width, height, centerY } = this.canopyParams;
+        let geo;
+
+        switch (shape) {
+          case 'sphere':
+            geo = new THREE.SphereGeometry(width, 24, 16);
+            break;
+          case 'ellipsoid':
+            geo = new THREE.SphereGeometry(1, 24, 16);
+            geo.scale(width, height / 2, width);
+            break;
+          case 'cone':
+            geo = new THREE.ConeGeometry(width, height, 24, 1, true);
+            break;
+          case 'cylinder':
+            geo = new THREE.CylinderGeometry(width, width, height, 24, 1, true);
+            break;
+          default:
+            return;
+        }
+
+        const mat = new THREE.MeshBasicMaterial({
+          color: 0x4488ff,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.15,
+          depthWrite: false,
+        });
+
+        this.canopyPreviewMesh = new THREE.Mesh(geo, mat);
+        this.canopyPreviewMesh.position.y = centerY;
+        this.scene.add(this.canopyPreviewMesh);
+      }
+
       fitCamera() {
         if (this.graph.nodes.size === 0) return;
         const box = new THREE.Box3();
@@ -1572,6 +1699,7 @@
             edge: { ...this.edgeParams },
             env: { ...this.envParams },
             collision: { ...this.collisionParams },
+            canopy: { ...this.canopyParams },
           },
         };
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1594,6 +1722,7 @@
               Object.assign(this.edgeParams, data.params.edge || {});
               Object.assign(this.envParams, data.params.env || {});
               Object.assign(this.collisionParams, data.params.collision || {});
+              Object.assign(this.canopyParams, data.params.canopy || {});
             }
             if (data.graph) {
               this.graph = Graph.fromJSON(data.graph);
