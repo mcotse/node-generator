@@ -1027,7 +1027,28 @@
           sphere: new THREE.SphereGeometry(1, 16, 12),
           cube: new THREE.BoxGeometry(1, 1, 1),
           octahedron: new THREE.OctahedronGeometry(1),
+          // New shapes
+          tetrahedron: new THREE.TetrahedronGeometry(1),
+          icosahedron: new THREE.IcosahedronGeometry(1, 0),
+          dodecahedron: new THREE.DodecahedronGeometry(1, 0),
+          cone: new THREE.ConeGeometry(0.7, 1.4, 8),
+          cylinder: new THREE.CylinderGeometry(0.5, 0.5, 1.2, 8),
+          torus: new THREE.TorusGeometry(0.6, 0.25, 8, 16),
+          torusknot: new THREE.TorusKnotGeometry(0.5, 0.18, 48, 8),
+          capsule: new THREE.CapsuleGeometry(0.4, 0.6, 4, 8),
+          diamond: null, // custom — built below
         };
+        this.geometries.diamond = this._buildDiamondGeometry();
+      }
+
+      _buildDiamondGeometry() {
+        const top = new THREE.ConeGeometry(0.7, 1, 6);
+        top.translate(0, 0.5, 0);
+        const bottom = new THREE.ConeGeometry(0.7, 0.6, 6);
+        bottom.rotateX(Math.PI);
+        bottom.translate(0, -0.3, 0);
+        const merged = mergeGeometries([top, bottom]);
+        return merged;
       }
 
       update(graph, params) {
@@ -1372,8 +1393,11 @@
 
       buildNodeFolder() {
         const f = this.gui.addFolder('Nodes');
-        f.add(this.app.nodeParams, 'shape', ['sphere', 'cube', 'octahedron'])
-          .name('Shape').onChange(() => this.app.updateVisuals());
+        f.add(this.app.nodeParams, 'shape', [
+          'sphere', 'cube', 'octahedron', 'tetrahedron', 'icosahedron',
+          'dodecahedron', 'cone', 'cylinder', 'torus', 'torusknot',
+          'capsule', 'diamond'
+        ]).name('Shape').onChange(() => this.app.updateVisuals());
         f.add(this.app.nodeParams, 'size', 0.02, 0.5)
           .name('Size').onChange(() => this.app.updateVisuals());
         f.addColor(this.app.nodeParams, 'color')
