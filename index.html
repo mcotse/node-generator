@@ -118,30 +118,40 @@
     // ─── Recursive Subdivision Generator ────────────────────────────────
 
     class RecursiveGenerator {
-      generate(params) {
+      generate(params, collision) {
         const { depth, branchAngle, lengthRatio, childrenCount, jitter, trunkLength } = params;
         const graph = new Graph();
         let nextId = 0;
 
         const rootId = nextId++;
         graph.addNode(rootId, new THREE.Vector3(0, 0, 0), { depth: 0, type: 'root' });
+        if (collision) collision.register(new THREE.Vector3(0, 0, 0), rootId);
 
         this._branch(graph, rootId, new THREE.Vector3(0, 1, 0), trunkLength, 0, depth,
-          branchAngle, lengthRatio, childrenCount, jitter, () => nextId++);
+          branchAngle, lengthRatio, childrenCount, jitter, () => nextId++, collision);
 
         return graph;
       }
 
       _branch(graph, parentId, direction, length, currentDepth, maxDepth,
-              angle, ratio, children, jitter, nextId) {
+              angle, ratio, children, jitter, nextId, collision) {
         if (currentDepth >= maxDepth) return;
 
         const parentPos = graph.getNode(parentId).position;
-        const endPos = parentPos.clone().add(direction.clone().multiplyScalar(length));
+        let endPos = parentPos.clone().add(direction.clone().multiplyScalar(length));
+
+          // Collision: deflect direction if needed, then check placement
+          if (collision) {
+            direction = collision.deflect(graph.getNode(parentId).position, direction, parentId, graph);
+            endPos.copy(graph.getNode(parentId).position).add(direction.clone().multiplyScalar(length));
+            if (!collision.canPlace(endPos, parentId, graph)) return;
+          }
+
         const nodeId = nextId();
         const isLeaf = currentDepth + 1 === maxDepth;
         graph.addNode(nodeId, endPos, { depth: currentDepth + 1, type: isLeaf ? 'leaf' : 'branch' });
         graph.addEdge(parentId, nodeId);
+          if (collision) collision.register(endPos, nodeId);
 
         const up = direction.clone().normalize();
         const perp = new THREE.Vector3(1, 0, 0);
@@ -159,7 +169,7 @@
             .normalize();
 
           this._branch(graph, nodeId, newDir, length * ratio, currentDepth + 1, maxDepth,
-            angle, ratio, children, jitter, nextId);
+            angle, ratio, children, jitter, nextId, collision);
         }
       }
     }
@@ -167,7 +177,7 @@
     // ─── L-System Generator ─────────────────────────────────────────────
 
     class LSystemGenerator {
-      generate(params) {
+      generate(params, collision) {
         const { depth, branchAngle, lengthRatio, jitter, trunkLength } = params;
         const axiom = 'F';
         const rules = { 'F': 'F[&+F]F[-\\F][^/F]' };
@@ -190,6 +200,7 @@
         let len = trunkLength;
         let parentId = nodeId;
         graph.addNode(nodeId++, pos.clone(), { depth: 0, type: 'root' });
+        if (collision) collision.register(pos.clone(), 0);
 
         const rad = branchAngle * Math.PI / 180;
 
@@ -197,10 +208,17 @@
           const j = (Math.random() - 0.5) * jitter * 0.5;
           switch (ch) {
             case 'F': {
-              const newPos = pos.clone().add(dir.clone().multiplyScalar(len));
+              let newPos = pos.clone().add(dir.clone().multiplyScalar(len));
+              // Collision check
+              if (collision && collision.enabled) {
+                dir = collision.deflect(pos, dir, parentId, graph);
+                newPos = pos.clone().add(dir.clone().multiplyScalar(len));
+                if (!collision.canPlace(newPos, parentId, graph)) break;
+              }
               const nid = nodeId++;
               graph.addNode(nid, newPos, { depth: stack.length, type: 'branch' });
               graph.addEdge(parentId, nid);
+              if (collision) collision.register(newPos, nid);
               pos = newPos;
               parentId = nid;
               break;
@@ -245,7 +263,7 @@
     // ─── Space Colonization Generator ───────────────────────────────────
 
     class SpaceColonizationGenerator {
-      generate(params) {
+      generate(params, collision) {
         const { depth, jitter, trunkLength } = params;
         const graph = new Graph();
         let nodeId = 0;
@@ -272,6 +290,7 @@
           const pos = new THREE.Vector3(0, (i / trunkSteps) * trunkLength, 0);
           const nid = nodeId++;
           graph.addNode(nid, pos, { depth: 0, type: i === 0 ? 'root' : 'branch' });
+          if (collision) collision.register(pos.clone(), nid);
           if (i > 0) graph.addEdge(nid - 1, nid);
         }
 
@@ -300,7 +319,7 @@
           if (influence.size === 0) break;
 
           for (const [nid, dirs] of influence) {
-            const avg = new THREE.Vector3();
+            let avg = new THREE.Vector3();
             for (const d of dirs) avg.add(d);
             avg.normalize();
             avg.x += (Math.random() - 0.5) * jitter * 0.3;
@@ -308,11 +327,18 @@
             avg.z += (Math.random() - 0.5) * jitter * 0.3;
             avg.normalize();
 
+            // Collision: deflect direction before computing final position
             const parentPos = graph.getNode(nid).position;
+            if (collision && collision.enabled) {
+              avg = collision.deflect(parentPos, avg, nid, graph);
+            }
+
             const newPos = parentPos.clone().add(avg.multiplyScalar(segmentLength));
             const newId = nodeId++;
             const parentDepth = graph.getNode(nid).metadata.depth || 0;
+            if (collision && collision.enabled && !collision.canPlace(newPos, nid, graph)) continue;
             graph.addNode(newId, newPos, { depth: parentDepth + 1, type: 'branch' });
+            if (collision) collision.register(newPos, newId);
             graph.addEdge(nid, newId);
           }
         }
