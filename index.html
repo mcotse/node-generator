@@ -216,18 +216,19 @@
           const j = (Math.random() - 0.5) * jitter * 0.5;
           switch (ch) {
             case 'F': {
-              let newPos = pos.clone().add(dir.clone().multiplyScalar(len));
-              // Collision check
+              let stepDir = dir.clone();
+              let newPos = pos.clone().add(stepDir.clone().multiplyScalar(len));
+              // Collision check (use stepDir to avoid mutating turtle heading)
               if (collision && collision.enabled) {
-                dir = collision.deflect(pos, dir, parentId, graph);
-                newPos = pos.clone().add(dir.clone().multiplyScalar(len));
+                stepDir = collision.deflect(pos, dir, parentId, graph);
+                newPos = pos.clone().add(stepDir.clone().multiplyScalar(len));
                 if (!collision.canPlace(newPos, parentId, graph)) break;
               }
               if (canopy) {
                 const val = canopy.evaluate(newPos);
                 if (val <= 0) break;
-                dir = canopy.deflectInward(newPos, dir);
-                newPos = pos.clone().add(dir.clone().multiplyScalar(len));
+                stepDir = canopy.deflectInward(newPos, stepDir);
+                newPos = pos.clone().add(stepDir.clone().multiplyScalar(len));
               }
               const nid = nodeId++;
               graph.addNode(nid, newPos, { depth: stack.length, type: 'branch' });
@@ -1860,6 +1861,7 @@
             this.updatePostProcessing();
             this.updateVisuals();
             this.fitCamera();
+            this.updateCanopyPreview();
             this.guiManager.refreshDisplay();
           } catch (err) {
             console.error('Failed to import JSON:', err);
