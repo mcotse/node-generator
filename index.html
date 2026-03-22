@@ -377,6 +377,62 @@
       }
     }
 
+    class CollisionSystem {
+      constructor() {
+        this.index = null;
+        this.enabled = false;
+        this.minSpacing = 0.5;
+        this.deflectionStrength = 0.8;
+      }
+
+      init(cellSize) {
+        this.index = new SpatialIndex(cellSize);
+      }
+
+      register(position, id) {
+        if (this.index) this.index.insert(position, id);
+      }
+
+      canPlace(position, parentId, graph) {
+        if (!this.enabled || !this.index) return true;
+        const nearby = this.index.query(position, this.minSpacing);
+        for (const n of nearby) {
+          if (n.id === parentId) continue;
+          if (graph) {
+            const neighbors = graph.getNeighborIds(parentId);
+            if (neighbors.has(n.id)) continue;
+          }
+          return false;
+        }
+        return true;
+      }
+
+      deflect(position, direction, parentId, graph) {
+        if (!this.enabled || !this.index) return direction.clone();
+        const nearby = this.index.query(position, this.minSpacing * 1.5);
+        const deflected = direction.clone();
+
+        for (const n of nearby) {
+          if (n.id === parentId) continue;
+          if (graph && graph.getNeighborIds(parentId).has(n.id)) continue;
+
+          const away = position.clone().sub(n.position);
+          const dist = away.length();
+          if (dist < 0.001) continue;
+          away.normalize();
+
+          const influence = 1.0 - (dist / (this.minSpacing * 1.5));
+          deflected.addScaledVector(away, influence * this.deflectionStrength);
+        }
+
+        return deflected.normalize();
+      }
+
+      clear() {
+        if (this.index) this.index.clear();
+      }
+    }
+
     // ─── Flow Field Generator ─────────────────────────────────────────
 
     class FlowFieldGenerator {
@@ -1178,6 +1234,12 @@
           bloom: 0,
         };
 
+        this.collisionParams = {
+          enabled: false,
+          minSpacing: 0.5,
+          deflectionStrength: 0.8,
+        };
+
         // Scene
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color(this.envParams.background);
@@ -1236,6 +1298,8 @@
           noise: new NoiseGenerator(),
         };
 
+        this.collisionSystem = new CollisionSystem();
+
         // Renderers
         this.graph = new Graph();
         this.nodeRenderer = new NodeRenderer(this.scene);
@@ -1280,7 +1344,13 @@
             return;
           }
         }
-        this.graph = gen.generate(this.treeParams);
+        // Setup collision system
+        this.collisionSystem.enabled = this.collisionParams.enabled;
+        this.collisionSystem.minSpacing = this.collisionParams.minSpacing;
+        this.collisionSystem.deflectionStrength = this.collisionParams.deflectionStrength;
+        this.collisionSystem.init(this.collisionParams.minSpacing);
+
+        this.graph = gen.generate(this.treeParams, this.collisionSystem);
         this.updateVisuals();
         this.fitCamera();
       }
