@@ -2,7 +2,7 @@
 
 A hybrid 3D fractal tree visualizer built as a single HTML file using Three.js. Procedurally generates tree/branch structures using multiple algorithms, with full customization via lil-gui.
 
-![Screenshot](screenshot.png)
+![Demo](demo.gif)
 
 ## Features
 
